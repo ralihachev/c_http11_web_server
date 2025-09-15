@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <pthread.h>
 #include <zlib.h>
+#include <ctype.h>
 
 #define PORT 3000
 #define BUFFER_SIZE 8192
@@ -154,8 +155,42 @@ typedef struct
     int top_offender_count;
 } ddos_stats_t;
 
+typedef enum
+{
+    SECURITY_ACTION_LOG,
+    SECURITY_ACTION_BLOCK,
+    SECURITY_ACTION_BAN
+} security_action_t;
+
+typedef struct
+{
+    char pattern[256];
+    security_action_t action;
+    char description[256];
+    int ban_duration;   // if the action is ban
+    int case_sensitive; // case sensitive matching
+} security_rule_t;
+
+typedef struct
+{
+    security_rule_t *rules;
+    int rule_count;
+    int max_rules;
+    int enabled;
+} security_filter_t;
+
+typedef struct
+{
+    int blocked;
+    int should_ban;
+    int ban_duration;
+    char threat_type[128];
+    char matched_pattern[128];
+} security_check_result_t;
+
 ddos_stats_t ddos_stats = {0};
 rate_limit_config_t *global_rate_limit_config = NULL;
+security_filter_t *global_security_filter = NULL;
 
 // Function prototypes
 int create_socket();
@@ -189,6 +224,11 @@ int detect_ddos_pattern(rate_limit_config_t *config);
 void send_rate_limit_response(int client_fd, const char *client_ip, int retry_after);
 void send_ban_response(int client_fd, const char *client_ip, int ban_remaining);
 void cleanup_rate_limiting(rate_limit_config_t *config);
+security_filter_t *init_security_filter();
+int add_security_rule(security_filter_t *filter, const char *pattern, security_action_t action, const char *description, int ban_duration, int case_sensitive);
+security_check_result_t validate_request_security(security_filter_t *filter, const char *request_uri, const char *user_agent, const char *request_body);
+int validate_file_path(const char *requested_path, char *safe_path, size_t safe_path_len);
+void send_security_block_response(int client_fd, const char *threat_type);
 
 // Global variables for graceful shutdown
 volatile sig_atomic_t server_running = 1;
@@ -392,6 +432,46 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
 
         printf("[INFO] %s %s %s\n", request.method, request.path, request.version);
 
+        // process security validation
+        if (global_security_filter)
+        {
+            // Extract user agent from request headers
+            char *user_agent = NULL;
+            for (int i = 0; i < request.header_count; i++)
+            {
+                if (strcasecmp(request.headers[i].name, "User-Agent") == 0)
+                {
+                    user_agent = request.headers[i].value;
+                    break;
+                }
+            }
+
+            // Validate request for security threats
+            security_check_result_t security_result = validate_request_security(
+                global_security_filter, request.path, user_agent, request.body);
+
+            if (security_result.blocked)
+            {
+                if (security_result.should_ban)
+                {
+                    // Add IP to rate limiting ban list
+                    pthread_mutex_lock(&global_rate_limit_config->mutex);
+                    rate_limit_entry_t *entry = find_or_create_entry(global_rate_limit_config, client_ip);
+                    entry->blocked_until = time(NULL) + security_result.ban_duration;
+                    entry->violation_count += 10; // Heavy penalty for security violations
+                    pthread_mutex_unlock(&global_rate_limit_config->mutex);
+
+                    send_ban_response(client_fd, client_ip, security_result.ban_duration);
+                }
+                else
+                {
+                    send_security_block_response(client_fd, security_result.threat_type);
+                }
+                close(client_fd);
+                return;
+            }
+        }
+
         // Check for keep-alive
         keep_connection = request.keep_alive;
 
@@ -413,7 +493,18 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
             url_decode(decoded_path, filepath);
             strcpy(filepath, decoded_path);
 
-            printf("[INFO] Serving file: %s\n", filepath);
+            // Validate and sanitize file path
+            char safe_filepath[MAX_PATH];
+            if (validate_file_path(request.path, safe_filepath, sizeof(safe_filepath)) < 0)
+            {
+                send_security_block_response(client_fd, "PATH_TRAVERSAL");
+                close(client_fd);
+                return;
+            }
+
+            // Use safe_filepath instead of original request.path for file operations
+            strcpy(filepath, safe_filepath);
+            printf("[INFO] Serving safe file: %s\n", filepath);
 
             if (strcmp(request.method, "HEAD") == 0)
             {
@@ -1186,6 +1277,320 @@ void send_ban_response(int client_fd, const char *client_ip, int ban_remaining)
     printf("[INFO] Sent 403 ban response to %s (%ds remaining)\n", client_ip, ban_remaining);
 }
 
+// initialise security filter with common patterns
+security_filter_t *init_security_filter()
+{
+    security_filter_t *filter = malloc(sizeof(security_filter_t));
+    if (!filter)
+        return NULL;
+
+    filter->max_rules = 50;
+    filter->rules = malloc(sizeof(security_rule_t) * filter->max_rules);
+    if (!filter->rules)
+    {
+        free(filter);
+        return NULL;
+    }
+
+    filter->rule_count = 0;
+    filter->enabled = 1;
+
+    // SQL Injection patterns
+    add_security_rule(filter, "union.*select", SECURITY_ACTION_BLOCK, "SQL Injection - UNION SELECT", 0, 0);
+    add_security_rule(filter, "insert.*into", SECURITY_ACTION_BLOCK, "SQL Injection - INSERT INTO", 0, 0);
+    add_security_rule(filter, "update.*set", SECURITY_ACTION_BLOCK, "SQL Injection - UPDATE SET", 0, 0);
+    add_security_rule(filter, "delete.*from", SECURITY_ACTION_BLOCK, "SQL Injection - DELETE FROM", 0, 0);
+    add_security_rule(filter, "drop.*table", SECURITY_ACTION_BAN, "SQL Injection - DROP TABLE", 3600, 0);
+    add_security_rule(filter, "exec.*sp_", SECURITY_ACTION_BLOCK, "SQL Injection - Stored Procedure", 0, 0);
+    add_security_rule(filter, ".*'.*or.*'.*=.*'", SECURITY_ACTION_BLOCK, "SQL Injection - OR clause", 0, 0);
+    add_security_rule(filter, ".*'.*and.*'.*=.*'", SECURITY_ACTION_BLOCK, "SQL Injection - AND clause", 0, 0);
+    add_security_rule(filter, ".*--.*", SECURITY_ACTION_LOG, "SQL Comment", 0, 0);
+    add_security_rule(filter, ".*/\\*.*\\*/", SECURITY_ACTION_LOG, "SQL Block Comment", 0, 0);
+
+    // Path Traversal patterns
+    add_security_rule(filter, "\\.\\./", SECURITY_ACTION_BLOCK, "Path Traversal - Unix", 0, 1);
+    add_security_rule(filter, "\\.\\.\\\\/", SECURITY_ACTION_BLOCK, "Path Traversal - Windows", 0, 1);
+    add_security_rule(filter, "%2e%2e%2f", SECURITY_ACTION_BLOCK, "Path Traversal - URL Encoded", 0, 0);
+    add_security_rule(filter, "%2e%2e/", SECURITY_ACTION_BLOCK, "Path Traversal - Partial URL Encoded", 0, 0);
+    add_security_rule(filter, "..%2f", SECURITY_ACTION_BLOCK, "Path Traversal - Mixed Encoding", 0, 0);
+    add_security_rule(filter, "%c0%ae%c0%ae/", SECURITY_ACTION_BLOCK, "Path Traversal - Double URL Encoded", 0, 0);
+    add_security_rule(filter, "/etc/passwd", SECURITY_ACTION_BAN, "Path Traversal - System File Access", 1800, 0);
+    add_security_rule(filter, "/etc/shadow", SECURITY_ACTION_BAN, "Path Traversal - Password File", 1800, 0);
+    add_security_rule(filter, "/proc/", SECURITY_ACTION_BLOCK, "Path Traversal - Proc filesystem", 0, 0);
+
+    // Script Injection patterns
+    add_security_rule(filter, "<script", SECURITY_ACTION_BLOCK, "XSS - Script Tag", 0, 0);
+    add_security_rule(filter, "</script>", SECURITY_ACTION_BLOCK, "XSS - Script End Tag", 0, 0);
+    add_security_rule(filter, "javascript:", SECURITY_ACTION_BLOCK, "XSS - JavaScript Protocol", 0, 0);
+    add_security_rule(filter, "vbscript:", SECURITY_ACTION_BLOCK, "XSS - VBScript Protocol", 0, 0);
+    add_security_rule(filter, "onload=", SECURITY_ACTION_BLOCK, "XSS - OnLoad Event", 0, 0);
+    add_security_rule(filter, "onerror=", SECURITY_ACTION_BLOCK, "XSS - OnError Event", 0, 0);
+    add_security_rule(filter, "onclick=", SECURITY_ACTION_BLOCK, "XSS - OnClick Event", 0, 0);
+    add_security_rule(filter, "eval\\(", SECURITY_ACTION_BLOCK, "Script Injection - Eval", 0, 0);
+    add_security_rule(filter, "document\\.cookie", SECURITY_ACTION_BLOCK, "XSS - Cookie Theft", 0, 0);
+    add_security_rule(filter, "document\\.write", SECURITY_ACTION_BLOCK, "XSS - Document Write", 0, 0);
+    add_security_rule(filter, "alert\\(", SECURITY_ACTION_LOG, "XSS - Alert Box", 0, 0);
+    add_security_rule(filter, "prompt\\(", SECURITY_ACTION_LOG, "XSS - Prompt Box", 0, 0);
+    add_security_rule(filter, "confirm\\(", SECURITY_ACTION_LOG, "XSS - Confirm Box", 0, 0);
+
+    // Command Injection patterns
+    add_security_rule(filter, "system\\(", SECURITY_ACTION_BAN, "Command Injection - System", 3600, 0);
+    add_security_rule(filter, "exec\\(", SECURITY_ACTION_BAN, "Command Injection - Exec", 3600, 0);
+    add_security_rule(filter, "passthru\\(", SECURITY_ACTION_BAN, "Command Injection - Passthru", 3600, 0);
+    add_security_rule(filter, "shell_exec", SECURITY_ACTION_BAN, "Command Injection - Shell Exec", 3600, 0);
+    add_security_rule(filter, "\\|\\|", SECURITY_ACTION_BLOCK, "Command Injection - OR operator", 0, 1);
+    add_security_rule(filter, "&&", SECURITY_ACTION_BLOCK, "Command Injection - AND operator", 0, 1);
+    add_security_rule(filter, ";.*rm.*", SECURITY_ACTION_BAN, "Command Injection - Remove command", 3600, 0);
+    add_security_rule(filter, ";.*cat.*", SECURITY_ACTION_BLOCK, "Command Injection - Cat command", 0, 0);
+
+    // Data URI and File inclusion
+    add_security_rule(filter, "data:text/html", SECURITY_ACTION_BLOCK, "Data URI XSS", 0, 0);
+    add_security_rule(filter, "data:application/javascript", SECURITY_ACTION_BLOCK, "Data URI Script", 0, 0);
+    add_security_rule(filter, "file://", SECURITY_ACTION_BLOCK, "Local File Inclusion", 0, 0);
+    add_security_rule(filter, "php://", SECURITY_ACTION_BLOCK, "PHP Stream Wrapper", 0, 0);
+
+    printf("[INFO] Security filter initialized with %d rules\n", filter->rule_count);
+    return filter;
+}
+
+int add_security_rule(security_filter_t *filter, const char *pattern, security_action_t action, const char *description, int ban_duration, int case_sensitive)
+{
+    if (!filter || filter->rule_count >= filter->max_rules)
+    {
+        return -1;
+    }
+
+    security_rule_t *rule = &filter->rules[filter->rule_count];
+    strncpy(rule->pattern, pattern, sizeof(rule->pattern) - 1);
+    rule->pattern[sizeof(rule->pattern) - 1] = '\0';
+
+    strncpy(rule->description, description, sizeof(rule->description) - 1);
+    rule->description[sizeof(rule->description) - 1] = '\0';
+
+    rule->action = action;
+    rule->ban_duration = ban_duration;
+    rule->case_sensitive = case_sensitive;
+
+    filter->rule_count++;
+    return 0;
+}
+
+// simple pattern matching (basic regex-like functionality)
+int pattern_match(const char *text, const char *pattern, int case_sensitive)
+{
+    if (!text || !pattern)
+    {
+        return 0;
+    }
+
+    char *text_copy = strdup(text);
+    char *pattern_copy = strdup(pattern);
+
+    if (!text_copy || !pattern_copy)
+    {
+        free(text_copy);
+        free(pattern_copy);
+        return 0;
+    }
+
+    // Convert to lowercase if case insensitive
+    if (!case_sensitive)
+    {
+        for (int i = 0; text_copy[i]; i++)
+        {
+            text_copy[i] = tolower(text_copy[i]);
+        }
+        for (int i = 0; pattern_copy[i]; i++)
+        {
+            pattern_copy[i] = tolower(pattern_copy[i]);
+        }
+    }
+
+    // Simple wildcard matching and basic regex
+    int match = 0;
+
+    // Check for exact substring match first
+    if (strstr(text_copy, pattern_copy))
+    {
+        match = 1;
+    }
+    // Handle basic regex patterns
+    else if (strchr(pattern_copy, '\\'))
+    {
+        // Simple regex handling - convert \\( to (, \\. to ., etc.
+        char *regex_pattern = malloc(strlen(pattern_copy) + 1);
+        if (regex_pattern)
+        {
+            int j = 0;
+            for (int i = 0; pattern_copy[i]; i++)
+            {
+                if (pattern_copy[i] == '\\' && pattern_copy[i + 1])
+                {
+                    i++; // Skip backslash
+                    regex_pattern[j++] = pattern_copy[i];
+                }
+                else
+                {
+                    regex_pattern[j++] = pattern_copy[i];
+                }
+            }
+            regex_pattern[j] = '\0';
+
+            if (strstr(text_copy, regex_pattern))
+            {
+                match = 1;
+            }
+            free(regex_pattern);
+        }
+    }
+
+    free(text_copy);
+    free(pattern_copy);
+    return match;
+}
+
+security_check_result_t validate_request_security(security_filter_t *filter, const char *request_uri, const char *user_agent, const char *request_body)
+{
+    security_check_result_t result = {0};
+
+    if (!filter || !filter->enabled)
+    {
+        return result;
+    }
+
+    // Combine all request data for scanning
+    size_t total_len = strlen(request_uri) + (user_agent ? strlen(user_agent) : 0) + (request_body ? strlen(request_body) : 0) + 10;
+
+    char *combined_data = malloc(total_len);
+    if (!combined_data)
+    {
+        return result;
+    }
+
+    snprintf(combined_data, total_len, "%s %s %s", request_uri, user_agent ? user_agent : "", request_body ? request_body : "");
+
+    // check against all security rules
+    for (int i = 0; i < filter->rule_count; i++)
+    {
+        security_rule_t *rule = &filter->rules[i];
+
+        if (pattern_match(combined_data, rule->pattern, rule->case_sensitive))
+        {
+            strcpy(result.threat_type, rule->description);
+            strcpy(result.matched_pattern, rule->pattern);
+
+            switch (rule->action)
+            {
+            case SECURITY_ACTION_LOG:
+                printf("[SECURITY] Suspicious pattern detected: %s in request from URI: %s\n", rule->description, request_uri);
+                break;
+
+            case SECURITY_ACTION_BLOCK:
+                printf("[SECURITY] Blocked malicious request: %s - Pattern: %s\n", rule->description, rule->pattern);
+                result.blocked = 1;
+                break;
+
+            case SECURITY_ACTION_BAN:
+                printf("[SECURITY] Malicious request detected - BANNING: %s - Pattern: %s\n", rule->description, rule->pattern);
+                result.blocked = 1;
+                result.should_ban = 1;
+                result.ban_duration = rule->ban_duration;
+                break;
+            }
+
+            // Stop at first match for efficiency
+            break;
+        }
+    }
+
+    free(combined_data);
+    return result;
+}
+
+// validate and sanitize file paths
+int validate_file_path(const char *requested_path, char *safe_path, size_t safe_path_len)
+{
+    if (!requested_path || !safe_path)
+    {
+        return -1;
+    }
+
+    // Remove leading slash if present
+    const char *path = requested_path;
+    if (path[0] == '/')
+    {
+        path++;
+    }
+
+    // decode the path first
+    char decoded_path[MAX_PATH];
+    url_decode(decoded_path, path);
+
+    // Check for path traversal attempts
+    if (strstr(decoded_path, "..") ||
+        strstr(decoded_path, "%2e%2e") ||
+        strstr(decoded_path, "%c0%ae") ||
+        decoded_path[0] == '/' ||
+        strstr(decoded_path, "\\"))
+    {
+
+        printf("[SECURITY] Path traversal attempt detected: %s\n", decoded_path);
+        return -1;
+    }
+
+    // Check for system file access attempts
+    const char *forbidden_paths[] = {
+        "etc/passwd", "etc/shadow", "etc/hosts",
+        "proc/", "sys/", "dev/", "var/log/",
+        "boot/", "root/", "home/",
+        ".ssh/", ".bash_history", ".env",
+        "config", "settings", "database",
+        NULL};
+
+    for (int i = 0; forbidden_paths[i]; i++)
+    {
+        if (strstr(decoded_path, forbidden_paths[i]))
+        {
+            printf("[SECURITY] Forbidden path access attempt: %s\n", decoded_path);
+            return -1;
+        }
+    }
+
+    // Ensure path stays within document root
+    char normalized_path[MAX_PATH];
+    snprintf(normalized_path, sizeof(normalized_path), "./%s", decoded_path);
+
+    // Additional validation: ensure file extension is allowed
+    const char *allowed_extensions[] = {
+        ".html", ".htm", ".css", ".js", ".json", ".txt", ".png",
+        ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf", ".zip",
+        NULL};
+
+    char *extension = strrchr(decoded_path, '.');
+    if (extension)
+    {
+        int allowed = 0;
+        for (int i = 0; allowed_extensions[i]; i++)
+        {
+            if (strcasecmp(extension, allowed_extensions[i]) == 0)
+            {
+                allowed = 1;
+                break;
+            }
+        }
+        if (!allowed)
+        {
+            printf("[SECURITY] Forbidden file extension: %s\n", extension);
+            return -1;
+        }
+    }
+
+    strncpy(safe_path, normalized_path, safe_path_len - 1);
+    safe_path[safe_path_len - 1] = '\0';
+
+    return 0;
+}
+
 // Safe send function with error handling
 int safe_send(int sockfd, const void *buf, size_t len)
 {
@@ -1500,6 +1905,40 @@ void send_500(int client_fd, int keep_alive)
     send_response(client_fd, HTTP_500, &content, body, strlen(body), keep_alive);
 }
 
+void send_security_block_response(int client_fd, const char *threat_type)
+{
+    char *body =
+        "<!DOCTYPE html>"
+        "<html><head><title>403 Forbidden - Security Policy Violation</title></head>"
+        "<body><h1>403 Forbidden</h1>"
+        "<p>Your request has been blocked by our security policy.</p>"
+        "<p>Threat detected: %s</p>"
+        "<p>If you believe this is an error, please contact the administrator.</p>"
+        "</body></html>";
+
+    char response_body[1024];
+    snprintf(response_body, sizeof(response_body), body, threat_type);
+
+    char response[BUFFER_SIZE];
+    char time_str[128];
+    get_current_time(time_str);
+
+    int header_length = snprintf(response, sizeof(response),
+                                 "HTTP/1.1 403 Forbidden\r\n"
+                                 "Date: %s\r\n"
+                                 "Server: CustomWebServer/1.0\r\n"
+                                 "Content-Type: text/html; charset=utf-8\r\n"
+                                 "Content-Length: %zu\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 time_str, strlen(response_body));
+
+    safe_send(client_fd, response, header_length);
+    safe_send(client_fd, response_body, strlen(response_body));
+
+    printf("[INFO] Sent 403 security block response - Threat: %s\n", threat_type);
+}
+
 // get MIME type
 char *get_mime_type(char *filepath)
 {
@@ -1617,6 +2056,14 @@ int main(int argc, char *argv[])
     if (!global_rate_limit_config)
     {
         printf("[ERROR] Failed to initialize rate limiting\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // In main function, after rate limiting initialization:
+    global_security_filter = init_security_filter();
+    if (!global_security_filter)
+    {
+        printf("[ERROR] Failed to initialize security filter\n");
         exit(EXIT_FAILURE);
     }
 
