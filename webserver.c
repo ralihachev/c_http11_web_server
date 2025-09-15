@@ -100,6 +100,19 @@ typedef struct
     int should_compress;
 } negotiated_content_t;
 
+typedef struct
+{
+    int enable_hsts;
+    int enable_csp;
+    int enable_xss_protection;
+    int enable_content_type_options;
+    int enable_frame_options;
+    char frame_options[32];      // deny, same origin, allow-from
+    char csp_policy[512];        // content security policy
+    int hsts_max_age;            // in seconds
+    int hsts_include_subdomains; // include subdomains directive
+} security_headers_t;
+
 // Function prototypes
 int create_socket();
 int bind_socket(int sockfd, int port);
@@ -123,6 +136,8 @@ float parse_quality(char *header_value, char *target_value);
 negotiated_content_t negotiate_content(char *filepath, http_request_t *request);
 int compress_gzip(const char *input, size_t input_len, char **output, size_t *output_len);
 int should_compress_content(const char *content_type, size_t contnet_length);
+security_headers_t get_default_security_headers();
+void add_security_headers(char *response_buffer, size_t buffer_size, int *header_length, security_headers_t *security_config, int is_https);
 
 // Global variables for graceful shutdown
 volatile sig_atomic_t server_running = 1;
@@ -621,6 +636,112 @@ int should_compress_content(const char *content_type, size_t content_length)
     return 0;
 }
 
+// default security configuration
+security_headers_t get_default_security_headers()
+{
+    security_headers_t headers = {0};
+
+    // enable basic security headers
+    headers.enable_xss_protection = 1;
+    headers.enable_content_type_options = 1;
+    headers.enable_frame_options = 1;
+    strcpy(headers.frame_options, "SAMEORIGIN");
+
+    // basic csp - allows same origin, inline styles, but restricts scripts
+    strcpy(headers.csp_policy, "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'");
+    headers.enable_csp = 1;
+
+    // hsts disabled by default - only enable with HTTPS
+    headers.enable_hsts = 0;
+    headers.hsts_max_age = 31536000; // 1 year
+    headers.hsts_include_subdomains = 0;
+
+    return headers;
+}
+
+void add_security_headers(char *response_buffer, size_t buffer_size, int *header_length, security_headers_t *security_config, int is_https)
+{
+    char temp_header[256];
+
+    // prevent mime type sniffing
+    if (security_config->enable_content_type_options)
+    {
+        strcpy(temp_header, "X-Content-Type-Options: nosniff\r\n");
+        if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+        {
+            strcat(response_buffer, temp_header);
+            *header_length += strlen(temp_header);
+        }
+    }
+
+    // prevent clickjacking
+    if (security_config->enable_frame_options)
+    {
+        snprintf(temp_header, sizeof(temp_header), "X-Frame-Options: %s\r\n",
+                 security_config->frame_options);
+        if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+        {
+            strcat(response_buffer, temp_header);
+            *header_length += strlen(temp_header);
+        }
+    }
+
+    // enable xss filtering
+    if (security_config->enable_xss_protection)
+    {
+        strcpy(temp_header, "X-XSS-Protection: 1; mode=block\r\n");
+        if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+        {
+            strcat(response_buffer, temp_header);
+            *header_length += strlen(temp_header);
+        }
+    }
+
+    // prevent xss and injection attacks
+    if (security_config->enable_csp && strlen(security_config->csp_policy) > 0)
+    {
+        snprintf(temp_header, sizeof(temp_header), "Content-Security-Policy: %s\r\n", security_config->csp_policy);
+        if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+        {
+            strcat(response_buffer, temp_header);
+            *header_length += strlen(temp_header);
+        }
+    }
+
+    // only for HTTPS connections
+    if (security_config->enable_hsts && is_https)
+    {
+        if (security_config->hsts_include_subdomains)
+        {
+            snprintf(temp_header, sizeof(temp_header), "Strict-Transport-Security: max-age=%d; includeSubDomains\r\n", security_config->hsts_max_age);
+        }
+        else
+        {
+            snprintf(temp_header, sizeof(temp_header), "Strict-Transport-Security: max-age=%d\r\n", security_config->hsts_max_age);
+        }
+        if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+        {
+            strcat(response_buffer, temp_header);
+            *header_length += strlen(temp_header);
+        }
+    }
+
+    // additional security headers
+    strcpy(temp_header, "Referrer-Policy: strict-origin-when-cross-origin\r\n");
+    if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+    {
+        strcat(response_buffer, temp_header);
+        *header_length += strlen(temp_header);
+    }
+
+    strcpy(temp_header, "X-Permitted-Cross-Domain-Policies: none\r\n");
+    if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
+    {
+        strcat(response_buffer, temp_header);
+        *header_length += strlen(temp_header);
+    }
+}
+
 // Safe send function with error handling
 int safe_send(int sockfd, const void *buf, size_t len)
 {
@@ -647,9 +768,12 @@ int safe_send(int sockfd, const void *buf, size_t len)
 // response function with keep-alive support
 void send_response(int client_fd, char *status, negotiated_content_t *content, char *body, size_t body_length, int keep_alive)
 {
-    char response[BUFFER_SIZE];
+    char response[BUFFER_SIZE * 2]; // double the buffer size for security headers
     char time_str[128];
     char content_type_header[256];
+
+    // get security configuration
+    security_headers_t security_config = get_default_security_headers();
 
     get_current_time(time_str);
 
@@ -706,6 +830,8 @@ void send_response(int client_fd, char *status, negotiated_content_t *content, c
     strcat(response, vary_header);
     header_length += strlen(vary_header);
 
+    // Add security headers
+    add_security_headers(response, sizeof(response), &header_length, &security_config, 0); // 0 = HTTP (not HTTPS)
     // End headers
     strcat(response, "\r\n");
     header_length += 2;
