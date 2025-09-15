@@ -82,6 +82,8 @@ typedef struct
     char accept_language[MAX_HEADER_SIZE];
     char accept_encoding[MAX_HEADER_SIZE];
     char accept_charset[MAX_HEADER_SIZE];
+    char params[10][2][256];
+    int param_count;
 } http_request_t;
 
 typedef struct
@@ -188,9 +190,52 @@ typedef struct
     char matched_pattern[128];
 } security_check_result_t;
 
+// route handler function pointer
+typedef struct api_response (*route_handler_t)(http_request_t *req, struct api_response *res);
+// middleware function pointer
+typedef int (*middleware_t)(http_request_t *req, struct api_response *res, void (*next)());
+
+typedef struct
+{
+    char method[8]; // get, put, post, delete
+    char path[256];
+    route_handler_t handler;  // function to handle this route
+    middleware_t *middleware; // array of middleware functions
+    int middleware_count;
+} route_t;
+
+typedef struct
+{
+    route_t *routes;
+    int route_count;
+    int max_routes;
+    middleware_t *global_middleware;
+    int global_middleware_count;
+} router_t;
+
+typedef struct api_response
+{
+    int status_code;
+    char headers[MAX_HEADERS][MAX_HEADER_SIZE];
+    int header_count;
+    char *body;
+    size_t body_length;
+    int json_mode;
+} api_response_t;
+
+typedef struct
+{
+    middleware_t *middleware_chain;
+    int current_index;
+    int total_count;
+    http_request_t *req;
+    api_response_t *res;
+} middleware_context_t;
+
 ddos_stats_t ddos_stats = {0};
 rate_limit_config_t *global_rate_limit_config = NULL;
 security_filter_t *global_security_filter = NULL;
+router_t *api_router = NULL;
 
 // Function prototypes
 int create_socket();
@@ -229,6 +274,21 @@ int add_security_rule(security_filter_t *filter, const char *pattern, security_a
 security_check_result_t validate_request_security(security_filter_t *filter, const char *request_uri, const char *user_agent, const char *request_body);
 int validate_file_path(const char *requested_path, char *safe_path, size_t safe_path_len);
 void send_security_block_response(int client_fd, const char *threat_type);
+router_t *create_router();
+void add_route(router_t *router, const char *method, const char *path, route_handler_t handler);
+void add_route_middleware(router_t *router, int route_index, middleware_t middleware);
+void use_middleware(router_t *router, middleware_t middleware);
+int match_route(const char *route_path, const char *request_path, char params[][256]);
+route_t *find_route(router_t *router, const char *method, const char *path);
+void next(middleware_context_t *ctx);
+void execute_middleware_chain(middleware_t *chain, int count, http_request_t *req, api_response_t *res, route_handler_t final_handler);
+void set_json_response(api_response_t *res, const char *json);
+void setup_routes(router_t *router);
+void handle_api_request(http_request_t *request, int client_fd, router_t *router);
+void send_api_response(int client_fd, api_response_t *response);
+char *get_param(http_request_t *request, const char *param_name);
+void extract_url_params(const char *route_path, const char *request_path, http_request_t *request);
+const char *get_status_text(int status_code);
 
 // Global variables for graceful shutdown
 volatile sig_atomic_t server_running = 1;
@@ -475,75 +535,83 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
         // Check for keep-alive
         keep_connection = request.keep_alive;
 
-        // Handle different HTTP methods
-        if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
+        if (strncmp(request.path, "/api/", 5) == 0)
         {
-            // Normalize path
-            if (strcmp(request.path, "/") == 0)
-            {
-                strcpy(request.path, "/index.html");
-            }
-
-            // Construct file path (remove leading slash)
-            char filepath[MAX_PATH];
-            snprintf(filepath, sizeof(filepath), ".%s", request.path);
-
-            // URL decode
-            char decoded_path[MAX_PATH];
-            url_decode(decoded_path, filepath);
-            strcpy(filepath, decoded_path);
-
-            // Validate and sanitize file path
-            char safe_filepath[MAX_PATH];
-            if (validate_file_path(request.path, safe_filepath, sizeof(safe_filepath)) < 0)
-            {
-                send_security_block_response(client_fd, "PATH_TRAVERSAL");
-                close(client_fd);
-                return;
-            }
-
-            // Use safe_filepath instead of original request.path for file operations
-            strcpy(filepath, safe_filepath);
-            printf("[INFO] Serving safe file: %s\n", filepath);
-
-            if (strcmp(request.method, "HEAD") == 0)
-            {
-                // HEAD request - send headers only
-                struct stat file_stat;
-                if (stat(filepath, &file_stat) == 0 && S_ISREG(file_stat.st_mode))
-                {
-                    negotiated_content_t content = negotiate_content(filepath, &request);
-                    send_response(client_fd, HTTP_200, &content, NULL, file_stat.st_size, keep_connection);
-                }
-                else
-                {
-                    send_404(client_fd, keep_connection);
-                }
-            }
-            else
-            {
-                // GET request - send full response
-                send_file(client_fd, filepath, keep_connection, &request);
-            }
-        }
-        else if (strcmp(request.method, "POST") == 0)
-        {
-            char *response_body = "POST request received successfully";
-            negotiated_content_t post_content = {0};
-            strcpy(post_content.content_type, "text/plain");
-            strcpy(post_content.charset, "utf-8");
-            send_response(client_fd, HTTP_200, &post_content, response_body, strlen(response_body), keep_connection);
+            // Handle API request
+            handle_api_request(&request, client_fd, api_router);
         }
         else
         {
-            send_400(client_fd, keep_connection);
-            keep_connection = 0; // Close connection on bad request
-        }
+            // Handle different HTTP methods
+            if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
+            {
+                // Normalize path
+                if (strcmp(request.path, "/") == 0)
+                {
+                    strcpy(request.path, "/index.html");
+                }
 
-        // For HTTP/1.0 or if Connection: close, don't keep alive
-        if (strstr(request.version, "1.0") || !keep_connection)
-        {
-            break;
+                // Construct file path (remove leading slash)
+                char filepath[MAX_PATH];
+                snprintf(filepath, sizeof(filepath), ".%s", request.path);
+
+                // URL decode
+                char decoded_path[MAX_PATH];
+                url_decode(decoded_path, filepath);
+                strcpy(filepath, decoded_path);
+
+                // Validate and sanitize file path
+                char safe_filepath[MAX_PATH];
+                if (validate_file_path(request.path, safe_filepath, sizeof(safe_filepath)) < 0)
+                {
+                    send_security_block_response(client_fd, "PATH_TRAVERSAL");
+                    close(client_fd);
+                    return;
+                }
+
+                // Use safe_filepath instead of original request.path for file operations
+                strcpy(filepath, safe_filepath);
+                printf("[INFO] Serving safe file: %s\n", filepath);
+
+                if (strcmp(request.method, "HEAD") == 0)
+                {
+                    // HEAD request - send headers only
+                    struct stat file_stat;
+                    if (stat(filepath, &file_stat) == 0 && S_ISREG(file_stat.st_mode))
+                    {
+                        negotiated_content_t content = negotiate_content(filepath, &request);
+                        send_response(client_fd, HTTP_200, &content, NULL, file_stat.st_size, keep_connection);
+                    }
+                    else
+                    {
+                        send_404(client_fd, keep_connection);
+                    }
+                }
+                else
+                {
+                    // GET request - send full response
+                    send_file(client_fd, filepath, keep_connection, &request);
+                }
+            }
+            else if (strcmp(request.method, "POST") == 0)
+            {
+                char *response_body = "POST request received successfully";
+                negotiated_content_t post_content = {0};
+                strcpy(post_content.content_type, "text/plain");
+                strcpy(post_content.charset, "utf-8");
+                send_response(client_fd, HTTP_200, &post_content, response_body, strlen(response_body), keep_connection);
+            }
+            else
+            {
+                send_400(client_fd, keep_connection);
+                keep_connection = 0; // Close connection on bad request
+            }
+
+            // For HTTP/1.0 or if Connection: close, don't keep alive
+            if (strstr(request.version, "1.0") || !keep_connection)
+            {
+                break;
+            }
         }
     }
 
@@ -1939,6 +2007,370 @@ void send_security_block_response(int client_fd, const char *threat_type)
     printf("[INFO] Sent 403 security block response - Threat: %s\n", threat_type);
 }
 
+// router & middleware handlers
+
+// initialise router
+router_t *create_router()
+{
+    router_t *router = malloc(sizeof(router_t));
+    router->routes = malloc(sizeof(route_t) * 100);
+    router->route_count = 0;
+    router->max_routes = 100;
+    router->global_middleware = malloc(sizeof(middleware_t) * 10);
+    router->global_middleware_count = 0;
+    return router;
+}
+
+// add route
+void add_route(router_t *router, const char *method, const char *path, route_handler_t handler)
+{
+    if (router->route_count >= router->max_routes)
+    {
+        return;
+    }
+
+    route_t *route = &router->routes[router->route_count];
+    strcpy(route->method, method);
+    strcpy(route->path, path);
+    route->handler = handler;
+    route->middleware = NULL;
+    route->middleware_count = 0;
+    router->route_count++;
+}
+
+// add middleware to specific route
+void add_route_middleware(router_t *router, int route_index, middleware_t middleware)
+{
+    route_t *route = &router->routes[route_index];
+    if (route->middleware == NULL)
+    {
+        route->middleware = malloc(sizeof(middleware_t) * 10);
+        route->middleware_count = 0;
+    }
+    route->middleware[route->middleware_count++] = middleware;
+}
+
+// add global middleware
+void use_middleware(router_t *router, middleware_t middleware)
+{
+    router->global_middleware[router->global_middleware_count++] = middleware;
+}
+
+// simple path matching (supports :id parameters)
+int match_route(const char *route_path, const char *request_path, char params[][256])
+{
+    // Skip leading slashes
+    const char *route_start = route_path;
+    const char *request_start = request_path;
+
+    if (route_start[0] == '/')
+        route_start++;
+    if (request_start[0] == '/')
+        request_start++;
+
+    char *route_copy = strdup(route_start);
+    char *request_copy = strdup(request_start);
+
+    // Use strtok_r for thread-safe tokenization
+    char *route_saveptr, *request_saveptr;
+    char *route_token = strtok_r(route_copy, "/", &route_saveptr);
+    char *request_token = strtok_r(request_copy, "/", &request_saveptr);
+    int param_count = 0;
+
+    while (route_token && request_token)
+    {
+        if (route_token[0] == ':')
+        {
+            // Parameter - store value
+            strcpy(params[param_count], request_token);
+            param_count++;
+        }
+        else if (strcmp(route_token, request_token) != 0)
+        {
+            free(route_copy);
+            free(request_copy);
+            return 0; // No match
+        }
+
+        route_token = strtok_r(NULL, "/", &route_saveptr);
+        request_token = strtok_r(NULL, "/", &request_saveptr);
+    }
+
+    int result = (route_token == NULL && request_token == NULL);
+
+    free(route_copy);
+    free(request_copy);
+    return result;
+}
+// find matching route
+route_t *find_route(router_t *router, const char *method, const char *path)
+{
+    char params[10][256]; // Store URL parameters
+
+    for (int i = 0; i < router->route_count; i++)
+    {
+        route_t *route = &router->routes[i];
+
+        if (strcmp(route->method, method) == 0)
+        {
+            if (match_route(route->path, path, params))
+            {
+                return route;
+            }
+        }
+    }
+    return NULL;
+}
+
+// next function for middleware chain
+void next(middleware_context_t *ctx)
+{
+    ctx->current_index++;
+    if (ctx->current_index < ctx->total_count)
+    {
+        middleware_t current = ctx->middleware_chain[ctx->current_index];
+        current(ctx->req, ctx->res, (void (*)())next);
+    }
+}
+
+// Execute middleware chain
+void execute_middleware_chain(middleware_t *chain, int count, http_request_t *req, api_response_t *res, route_handler_t final_handler)
+{
+    middleware_context_t ctx = {
+        .middleware_chain = chain,
+        .current_index = -1,
+        .total_count = count,
+        .req = req,
+        .res = res};
+
+    // Start middleware chain
+    next(&ctx);
+
+    // Execute final handler if all middleware passed
+    if (ctx.current_index >= count)
+    {
+        final_handler(req, res);
+    }
+}
+
+void set_json_response(api_response_t *res, const char *json)
+{
+    res->json_mode = 1;
+    res->body = strdup(json);
+    res->body_length = strlen(json);
+    res->status_code = 200;
+    sprintf(res->headers[res->header_count++], "Content-Type: application/json");
+}
+
+api_response_t get_users(http_request_t *req, api_response_t *res)
+{
+    set_json_response(res, "{\"users\": [{\"id\": 1, \"name\": \"John\"}, {\"id\": 2, \"name\": \"Jane\"}]}");
+    return *res;
+}
+
+int cors_middleware(http_request_t *req, api_response_t *res, void (*next)())
+{
+    sprintf(res->headers[res->header_count++], "Access-Control-Allow-Origin: *");
+    sprintf(res->headers[res->header_count++], "Access-Control-Allow-Methods: GET, POST, PUT, DELETE");
+    sprintf(res->headers[res->header_count++], "Access-Control-Allow-Headers: Content-Type, Authorization");
+    next();
+    return 1;
+}
+
+int logging_middleware(http_request_t *req, api_response_t *res, void (*next)())
+{
+    time_t now = time(NULL);
+    printf("[%s] %s %s\n", ctime(&now), req->method, req->path);
+    next();
+    return 1;
+}
+
+void setup_routes(router_t *router)
+{
+    // Global middleware
+    // use_middleware(router, cors_middleware);
+    // use_middleware(router, logging_middleware);
+
+    // API routes
+    add_route(router, "GET", "/api/users", get_users);
+}
+
+void handle_api_request(http_request_t *request, int client_fd, router_t *router)
+{
+    api_response_t response = {0};
+    char params[10][256] = {0}; // For URL parameters
+
+    // Initialize response
+    response.status_code = 404;
+    response.header_count = 0;
+    response.body = NULL;
+    response.json_mode = 0;
+
+    // Find matching route
+    route_t *route = find_route(router, request->method, request->path);
+
+    if (route)
+    {
+        // Extract URL parameters and add to request
+        extract_url_params(route->path, request->path, request);
+
+        // Build middleware chain (global + route-specific)
+        middleware_t full_chain[20];
+        int chain_count = 0;
+
+        // Add global middleware
+        for (int i = 0; i < router->global_middleware_count; i++)
+        {
+            full_chain[chain_count++] = router->global_middleware[i];
+        }
+
+        // Add route-specific middleware
+        for (int i = 0; i < route->middleware_count; i++)
+        {
+            full_chain[chain_count++] = route->middleware[i];
+        }
+
+        // Execute middleware chain + handler
+        execute_middleware_chain(full_chain, chain_count, request, &response, route->handler);
+    }
+    else
+    {
+        // 404 for API routes
+        response.status_code = 404;
+        set_json_response(&response, "{\"error\": \"API route not found\"}");
+    }
+
+    // Send response
+    send_api_response(client_fd, &response);
+
+    // Cleanup
+    if (response.body)
+    {
+        free(response.body);
+    }
+}
+
+const char *get_status_text(int status_code)
+{
+    switch (status_code)
+    {
+    case 200:
+        return "OK";
+    case 201:
+        return "Created";
+    case 204:
+        return "No Content";
+    case 304:
+        return "Not Modified";
+    case 400:
+        return "Bad Request";
+    case 401:
+        return "Unauthorized";
+    case 403:
+        return "Forbidden";
+    case 404:
+        return "Not Found";
+    case 405:
+        return "Method Not Allowed";
+    case 406:
+        return "Not Acceptable";
+    case 429:
+        return "Too Many Requests";
+    case 500:
+        return "Internal Server Error";
+    case 501:
+        return "Not Implemented";
+    case 502:
+        return "Bad Gateway";
+    case 503:
+        return "Service Unavailable";
+    default:
+        return "Unknown";
+    }
+}
+
+void extract_url_params(const char *route_path, const char *request_path, http_request_t *request)
+{
+    char *route_copy = strdup(route_path);
+    char *request_copy = strdup(request_path);
+
+    char *route_token = strtok(route_copy, "/");
+    char *request_token = strtok(request_copy, "/");
+    request->param_count = 0;
+
+    while (route_token && request_token)
+    {
+        if (route_token[0] == ':')
+        {
+            // Found parameter
+            strcpy(request->params[request->param_count][0], route_token + 1); // Skip ':'
+            strcpy(request->params[request->param_count][1], request_token);
+            request->param_count++;
+        }
+
+        route_token = strtok(NULL, "/");
+        request_token = strtok(NULL, "/");
+    }
+
+    free(route_copy);
+    free(request_copy);
+}
+
+// Helper to get parameter value
+char *get_param(http_request_t *request, const char *param_name)
+{
+    for (int i = 0; i < request->param_count; i++)
+    {
+        if (strcmp(request->params[i][0], param_name) == 0)
+        {
+            return request->params[i][1];
+        }
+    }
+    return NULL;
+}
+
+void send_api_response(int client_fd, api_response_t *response)
+{
+    char response_buffer[BUFFER_SIZE];
+    const char *status_text = get_status_text(response->status_code);
+
+    // Build response headers
+    int header_len = snprintf(response_buffer, sizeof(response_buffer),
+                              "HTTP/1.1 %d %s\r\n"
+                              "Server: CustomWebServer/1.0\r\n"
+                              "Connection: keep-alive\r\n",
+                              response->status_code, status_text);
+
+    // Add custom headers
+    for (int i = 0; i < response->header_count; i++)
+    {
+        header_len += snprintf(response_buffer + header_len,
+                               sizeof(response_buffer) - header_len,
+                               "%s\r\n", response->headers[i]);
+    }
+
+    // Add content length if body exists
+    if (response->body && response->body_length > 0)
+    {
+        header_len += snprintf(response_buffer + header_len,
+                               sizeof(response_buffer) - header_len,
+                               "Content-Length: %zu\r\n", response->body_length);
+    }
+
+    // End headers
+    header_len += snprintf(response_buffer + header_len,
+                           sizeof(response_buffer) - header_len, "\r\n");
+
+    // Send headers
+    send(client_fd, response_buffer, header_len, 0);
+
+    // Send body if exists
+    if (response->body && response->body_length > 0)
+    {
+        send(client_fd, response->body, response->body_length, 0);
+    }
+}
+
 // get MIME type
 char *get_mime_type(char *filepath)
 {
@@ -2066,6 +2498,10 @@ int main(int argc, char *argv[])
         printf("[ERROR] Failed to initialize security filter\n");
         exit(EXIT_FAILURE);
     }
+
+    // Initialize API router
+    api_router = create_router();
+    setup_routes(api_router);
 
     printf("[INFO] Server started successfully. Visit http://localhost:%d\n", port);
     printf("[INFO] Features: Keep-alive connections, threading, error handling\n");
