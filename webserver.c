@@ -113,6 +113,50 @@ typedef struct
     int hsts_include_subdomains; // include subdomains directive
 } security_headers_t;
 
+typedef struct
+{
+    char client_ip[INET_ADDRSTRLEN];
+    time_t window_start;
+    int request_count;
+    time_t last_request;
+    int blocked_until;   // Temporary ban timestamp
+    int violation_count; // Number of violations from this IP
+} rate_limit_entry_t;
+
+typedef struct
+{
+    int requests_per_window; // e.g., 100 requests
+    int window_size;         // e.g., 60 seconds
+    int ban_duration;        // e.g., 300 seconds (5 min ban)
+    int max_entries;         // cache size limit
+    int strict_mode;         // progressive penalties
+    int burst_threshold;     // burst threshold (requests in 1 second)
+    rate_limit_entry_t *entries;
+    int entry_count;
+    pthread_mutex_t mutex; // Mutex for thread-safe access
+} rate_limit_config_t;
+
+typedef enum
+{
+    RATE_LIMIT_ALLOW,
+    RATE_LIMIT_WARN,
+    RATE_LIMIT_BLOCK,
+    RATE_LIMIT_BAN
+} rate_limit_result_t;
+
+typedef struct
+{
+    time_t window_start;
+    int total_requests;
+    int unique_ips;
+    int blocked_requests;
+    char top_offender[INET_ADDRSTRLEN];
+    int top_offender_count;
+} ddos_stats_t;
+
+ddos_stats_t ddos_stats = {0};
+rate_limit_config_t *global_rate_limit_config = NULL;
+
 // Function prototypes
 int create_socket();
 int bind_socket(int sockfd, int port);
@@ -138,6 +182,13 @@ int compress_gzip(const char *input, size_t input_len, char **output, size_t *ou
 int should_compress_content(const char *content_type, size_t contnet_length);
 security_headers_t get_default_security_headers();
 void add_security_headers(char *response_buffer, size_t buffer_size, int *header_length, security_headers_t *security_config, int is_https);
+rate_limit_config_t *init_rate_limiting();
+rate_limit_entry_t *find_or_create_entry(rate_limit_config_t *config, const char *client_ip);
+rate_limit_result_t check_rate_limit(rate_limit_config_t *config, const char *client_ip);
+int detect_ddos_pattern(rate_limit_config_t *config);
+void send_rate_limit_response(int client_fd, const char *client_ip, int retry_after);
+void send_ban_response(int client_fd, const char *client_ip, int ban_remaining);
+void cleanup_rate_limiting(rate_limit_config_t *config);
 
 // Global variables for graceful shutdown
 volatile sig_atomic_t server_running = 1;
@@ -147,7 +198,19 @@ void handle_sigint(int sig)
     (void)sig;
     printf("\n[INFO] Received shutdown signal. Stopping server...\n");
     server_running = 0;
+    cleanup_rate_limiting(global_rate_limit_config);
     exit(0);
+}
+
+void cleanup_rate_limiting(rate_limit_config_t *config)
+{
+    if (config)
+    {
+        pthread_mutex_destroy(&config->mutex);
+        free(config->entries);
+        free(config);
+        printf("[INFO] Rate limiting cleanup completed\n");
+    }
 }
 
 // Create socket with error handling
@@ -243,6 +306,58 @@ void *handle_client_thread(void *arg)
 // client handling with connection management
 void handle_client(int client_fd, struct sockaddr_in client_addr)
 {
+    // check limits before processing the request
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+
+    if (global_rate_limit_config)
+    {
+        rate_limit_result_t rate_result = check_rate_limit(global_rate_limit_config, client_ip);
+
+        switch (rate_result)
+        {
+        case RATE_LIMIT_BAN:
+        {
+            // Find entry to get remaining ban time
+            pthread_mutex_lock(&global_rate_limit_config->mutex);
+            for (int i = 0; i < global_rate_limit_config->entry_count; i++)
+            {
+                if (strcmp(global_rate_limit_config->entries[i].client_ip, client_ip) == 0)
+                {
+                    int remaining = global_rate_limit_config->entries[i].blocked_until - time(NULL);
+                    pthread_mutex_unlock(&global_rate_limit_config->mutex);
+                    send_ban_response(client_fd, client_ip, remaining);
+                    close(client_fd);
+                    return;
+                }
+            }
+            pthread_mutex_unlock(&global_rate_limit_config->mutex);
+        }
+        break;
+
+        case RATE_LIMIT_BLOCK:
+            send_rate_limit_response(client_fd, client_ip, global_rate_limit_config->window_size);
+            close(client_fd);
+            return;
+
+        case RATE_LIMIT_WARN:
+            printf("[INFO] Client %s approaching rate limit\n", client_ip);
+            break;
+
+        case RATE_LIMIT_ALLOW:
+            break;
+        }
+
+        // check for DDoS patterns periodically
+        static time_t last_ddos_check = 0;
+        time_t now = time(NULL);
+        if (now - last_ddos_check >= 30)
+        { // Check every 30 seconds
+            detect_ddos_pattern(global_rate_limit_config);
+            last_ddos_check = now;
+        }
+    }
+
     char buffer[BUFFER_SIZE];
     http_request_t request;
     int keep_connection = 1;
@@ -742,6 +857,335 @@ void add_security_headers(char *response_buffer, size_t buffer_size, int *header
     }
 }
 
+rate_limit_config_t *init_rate_limiting()
+{
+    rate_limit_config_t *config = malloc(sizeof(rate_limit_config_t));
+    if (!config)
+    {
+        return NULL;
+    }
+
+    // default configuration - moderate protection
+    config->requests_per_window = 60;
+    config->window_size = 60;
+    config->ban_duration = 300;
+    config->max_entries = 1000; // track up to 1000 ips
+    config->strict_mode = 1;    // enable progressive penalties
+    config->burst_threshold = 100;
+
+    config->entries = malloc(sizeof(rate_limit_entry_t) * config->max_entries);
+    if (!config->entries)
+    {
+        free(config);
+        return NULL;
+    }
+
+    config->entry_count = 0;
+    // initialise mutex for thread safety
+    if (pthread_mutex_init(&config->mutex, NULL) != 0)
+    {
+        free(config->entries);
+        free(config);
+        return NULL;
+    }
+
+    memset(config->entries, 0, sizeof(rate_limit_entry_t) * config->max_entries);
+
+    printf("[INFO] Rate limiting initialized: %d req/%ds, %ds ban\n", config->requests_per_window, config->window_size, config->ban_duration);
+
+    return config;
+}
+
+// find or create rate limit entry for an IP
+rate_limit_entry_t *find_or_create_entry(rate_limit_config_t *config, const char *client_ip)
+{
+    time_t now = time(NULL);
+
+    // first, look for an existing entry
+    for (int i = 0; i < config->entry_count; i++)
+    {
+        if (strcmp(config->entries[i].client_ip, client_ip) == 0)
+        {
+            return &config->entries[i];
+        }
+    }
+
+    // if we have room, create a new entry
+    if (config->entry_count < config->max_entries)
+    {
+        rate_limit_entry_t *entry = &config->entries[config->entry_count];
+        strcpy(entry->client_ip, client_ip);
+        entry->window_start = now;
+        entry->request_count = 0;
+        entry->last_request = 0;
+        entry->blocked_until = 0;
+        entry->violation_count = 0;
+        config->entry_count++;
+        return entry;
+    }
+
+    // cache full - find oldest entry to replace (LRU eviction)
+    rate_limit_entry_t *oldest = &config->entries[0];
+    for (int i = 1; i < config->max_entries; i++)
+    {
+        if (config->entries[i].last_request < oldest->last_request)
+        {
+            oldest = &config->entries[i];
+        }
+    }
+
+    // Replace oldest entry
+    strcpy(oldest->client_ip, client_ip);
+    oldest->window_start = now;
+    oldest->request_count = 0;
+    oldest->last_request = 0;
+    oldest->blocked_until = 0;
+    oldest->violation_count = 0;
+
+    return oldest;
+}
+
+// main rate limiting check function
+rate_limit_result_t check_rate_limit(rate_limit_config_t *config, const char *client_ip)
+{
+    if (!config || !client_ip)
+    {
+        return RATE_LIMIT_ALLOW;
+    }
+
+    pthread_mutex_lock(&config->mutex);
+
+    time_t now = time(NULL);
+    rate_limit_entry_t *entry = find_or_create_entry(config, client_ip);
+
+    // check if ip is currently banned
+    if (entry->blocked_until > now)
+    {
+        pthread_mutex_unlock(&config->mutex);
+        printf("[SECURITY] Blocked request from banned IP: %s (ban expires in %lds)\n", client_ip, entry->blocked_until - now);
+        return RATE_LIMIT_BAN;
+    }
+
+    // reset window if expired
+    if (now - entry->window_start >= config->window_size)
+    {
+        entry->window_start = now;
+        entry->request_count = 0;
+    }
+
+    // check for burst (too many requests in 1 second)
+    if (entry->last_request > 0 && (now - entry->last_request == 0))
+    {
+        // multiple requests in same second - count them
+        static int same_second_count = 0;
+        same_second_count++;
+
+        if (same_second_count > config->burst_threshold)
+        {
+            entry->violation_count++;
+            entry->blocked_until = now + (config->ban_duration * entry->violation_count);
+
+            pthread_mutex_unlock(&config->mutex);
+            printf("[SECURITY] Burst detected from %s: %d requests/second (banned for %ds)\n", client_ip, same_second_count, config->ban_duration * entry->violation_count);
+            return RATE_LIMIT_BAN;
+        }
+    }
+    else
+    {
+        // Reset burst counter for new second
+        static int same_second_count = 0;
+    }
+
+    entry->last_request = now;
+    entry->request_count++;
+
+    // Check if limit exceeded
+    if (entry->request_count > config->requests_per_window)
+    {
+        entry->violation_count++;
+
+        if (config->strict_mode)
+        {
+            // Progressive penalties: longer bans for repeat offenders
+            int penalty_multiplier = (entry->violation_count > 5) ? 5 : entry->violation_count;
+            entry->blocked_until = now + (config->ban_duration * penalty_multiplier);
+
+            pthread_mutex_unlock(&config->mutex);
+            printf("[SECURITY] Rate limit exceeded by %s: %d/%d requests (banned for %ds, violation #%d)\n", client_ip, entry->request_count, config->requests_per_window, config->ban_duration * penalty_multiplier, entry->violation_count);
+            return RATE_LIMIT_BLOCK;
+        }
+        else
+        {
+            // Simple mode: just block this request
+            pthread_mutex_unlock(&config->mutex);
+            printf("[SECURITY] Rate limit exceeded by %s: %d/%d requests\n", client_ip, entry->request_count, config->requests_per_window);
+            return RATE_LIMIT_BLOCK;
+        }
+    }
+
+    // Warn when approaching limit (80% of limit)
+    if (entry->request_count > (config->requests_per_window * 0.8))
+    {
+        pthread_mutex_unlock(&config->mutex);
+        printf("[WARNING] IP %s approaching rate limit: %d/%d requests\n", client_ip, entry->request_count, config->requests_per_window);
+        return RATE_LIMIT_WARN;
+    }
+
+    pthread_mutex_unlock(&config->mutex);
+    return RATE_LIMIT_ALLOW;
+}
+
+int detect_ddos_pattern(rate_limit_config_t *config)
+{
+    time_t now = time(NULL);
+
+    // reset stats window every minute
+    if (now - ddos_stats.window_start >= 60)
+    {
+        ddos_stats.window_start = now;
+        ddos_stats.total_requests = 0;
+        ddos_stats.unique_ips = 0;
+        ddos_stats.blocked_requests = 0;
+        ddos_stats.top_offender_count = 0;
+        strcpy(ddos_stats.top_offender, "");
+    }
+
+    pthread_mutex_lock(&config->mutex);
+
+    // count active IPs and find top offender
+    int active_ips = 0;
+    int max_requests = 0;
+
+    for (int i = 0; i < config->entry_count; i++)
+    {
+        rate_limit_entry_t *entry = &config->entries[i];
+
+        if (now - entry->window_start < 60)
+        {
+            // active in last minute
+            active_ips++;
+
+            if (entry->request_count > max_requests)
+            {
+                max_requests = entry->request_count;
+                strcpy(ddos_stats.top_offender, entry->client_ip);
+                ddos_stats.top_offender_count = entry->request_count;
+            }
+
+            if (entry->blocked_until > now)
+            {
+                ddos_stats.blocked_requests++;
+            }
+        }
+    }
+
+    ddos_stats.unique_ips = active_ips;
+    pthread_mutex_unlock(&config->mutex);
+
+    // DDoS detection criteria
+    int ddos_detected = 0;
+
+    // criteria 1: Too many unique IPs hitting server simultaneously
+    if (active_ips > 50)
+    {
+        printf("[ALERT] Potential DDoS: %d unique IPs active\n", active_ips);
+        ddos_detected = 1;
+    }
+
+    // criteria 2: High percentage of blocked requests
+    if (ddos_stats.blocked_requests > 10)
+    {
+        printf("[ALERT] Potential DDoS: %d blocked requests in last minute\n", ddos_stats.blocked_requests);
+        ddos_detected = 1;
+    }
+
+    // criteria 3: Single IP with excessive requests
+    if (ddos_stats.top_offender_count > config->requests_per_window * 3)
+    {
+        printf("[ALERT] Potential DDoS: IP %s made %d requests\n", ddos_stats.top_offender, ddos_stats.top_offender_count);
+        ddos_detected = 1;
+    }
+
+    return ddos_detected;
+}
+
+void send_rate_limit_response(int client_fd, const char *client_ip, int retry_after)
+{
+    char *body =
+        "<!DOCTYPE html>"
+        "<html><head><title>429 Too Many Requests</title></head>"
+        "<body><h1>429 Too Many Requests</h1>"
+        "<p>You have exceeded the rate limit. Please slow down your requests.</p>"
+        "<p>Try again in <span id='countdown'></span> seconds.</p>"
+        "<script>"
+        "let seconds = %d;"
+        "function updateCountdown() {"
+        "  document.getElementById('countdown').textContent = seconds;"
+        "  if (seconds > 0) { seconds--; setTimeout(updateCountdown, 1000); }"
+        "}"
+        "updateCountdown();"
+        "</script>"
+        "</body></html>";
+
+    char response_body[1024];
+    snprintf(response_body, sizeof(response_body), body, retry_after);
+
+    char response[BUFFER_SIZE];
+    char time_str[128];
+    get_current_time(time_str);
+
+    int header_length = snprintf(response, sizeof(response),
+                                 "HTTP/1.1 429 Too Many Requests\r\n"
+                                 "Date: %s\r\n"
+                                 "Server: CustomWebServer/1.0\r\n"
+                                 "Content-Type: text/html; charset=utf-8\r\n"
+                                 "Content-Length: %zu\r\n"
+                                 "Retry-After: %d\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 time_str, strlen(response_body), retry_after);
+
+    safe_send(client_fd, response, header_length);
+    safe_send(client_fd, response_body, strlen(response_body));
+
+    printf("[INFO] Sent 429 response to %s (retry after %ds)\n", client_ip, retry_after);
+}
+
+// Send ban response for severely rate-limited IPs
+void send_ban_response(int client_fd, const char *client_ip, int ban_remaining)
+{
+    char *body =
+        "<!DOCTYPE html>"
+        "<html><head><title>403 Forbidden - Temporary Ban</title></head>"
+        "<body><h1>403 Forbidden</h1>"
+        "<p>Your IP address has been temporarily banned due to excessive requests.</p>"
+        "<p>Ban will be lifted in %d seconds.</p>"
+        "<p>Please respect the server's rate limits.</p>"
+        "</body></html>";
+
+    char response_body[1024];
+    snprintf(response_body, sizeof(response_body), body, ban_remaining);
+
+    char response[BUFFER_SIZE];
+    char time_str[128];
+    get_current_time(time_str);
+
+    int header_length = snprintf(response, sizeof(response),
+                                 "HTTP/1.1 403 Forbidden\r\n"
+                                 "Date: %s\r\n"
+                                 "Server: CustomWebServer/1.0\r\n"
+                                 "Content-Type: text/html; charset=utf-8\r\n"
+                                 "Content-Length: %zu\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 time_str, strlen(response_body));
+
+    safe_send(client_fd, response, header_length);
+    safe_send(client_fd, response_body, strlen(response_body));
+
+    printf("[INFO] Sent 403 ban response to %s (%ds remaining)\n", client_ip, ban_remaining);
+}
+
 // Safe send function with error handling
 int safe_send(int sockfd, const void *buf, size_t len)
 {
@@ -1165,6 +1609,14 @@ int main(int argc, char *argv[])
     if (listen_socket(server_fd) < 0)
     {
         close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Initialize rate limiting at server startup
+    global_rate_limit_config = init_rate_limiting();
+    if (!global_rate_limit_config)
+    {
+        printf("[ERROR] Failed to initialize rate limiting\n");
         exit(EXIT_FAILURE);
     }
 
