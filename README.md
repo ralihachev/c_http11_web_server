@@ -171,38 +171,42 @@ The project includes several test files to demonstrate functionality:
 
 ## HTTP Protocol Compliance Analysis
 
-This server implements **6 out of 7** core HTTP protocol layers (~85% compliance):
+This server implements **6.5 out of 7** core HTTP protocol layers (~90% compliance):
 
 ### ✅ **Implemented Layers**
 
 - ~~**HTTP Message Layer** (`webserver.c:304-395`)~~ - Request/response parsing, headers, body handling
 - ~~**HTTP Method Layer** (`webserver.c:241-290`)~~ - GET, HEAD, POST support with validation
-- ~~**HTTP Status Layer** (`webserver.c:805-847`)~~ - 200, 400, 404, 406, 500 status codes
+- ~~**HTTP Status Layer** (`webserver.c:805-847`)~~ - 200, 400, 404, 406, 429, 500 status codes
 - ~~**Connection Management** (`webserver.c:238-297`)~~ - HTTP/1.1 keep-alive, persistent connections
 - ~~**Content-Type Layer** (`webserver.c:466-543`)~~ - MIME detection + content negotiation (Accept headers)
 - ~~**Content Encoding Layer** (`webserver.c:545-620`, `webserver.c:733-802`)~~ - gzip compression with quality parsing
 
-### 🔄 **Partially Implemented**
+### 🔄 **Partially Implemented Security Layer**
 
-- **HTTP Headers** - ~~Basic parsing/generation~~ but missing some advanced headers (Range, etc.)
+- ~~**Application Security Headers** (`webserver.c:755-812`)~~ - CSP, XSS protection, frame options, content-type options
+- ~~**Rate Limiting & DDoS Protection** (`webserver.c:860-1112`)~~ - Per-IP throttling, progressive bans, burst detection
+- ~~**Request Validation** (`webserver.c:250-296`)~~ - IP-based blocking and monitoring
+- **Missing**: HTTPS/TLS, authentication, advanced request filtering
 
 ### ❌ **Missing Layers**
 
 - [ ] **Caching Layer** - Cache-Control, ETag, Last-Modified, conditional requests
-- [ ] **Security/Auth Layer** - HTTPS/TLS, authentication, CORS, security headers
 
 ### 🚧 **Future Enhancement Opportunities**
 
 - [ ] Range requests for partial content (`Range: bytes=0-1023`)
 - ~~Content negotiation (`Accept`, `Accept-Language` headers)~~ ✅ **IMPLEMENTED**
 - ~~Request/response compression for bandwidth optimization~~ ✅ **IMPLEMENTED**
+- ~~Application security headers (CSP, XSS protection, frame options)~~ ✅ **IMPLEMENTED**
+- ~~Rate limiting and DDoS protection~~ ✅ **IMPLEMENTED**
 - [ ] Conditional requests (`If-Modified-Since`, `If-None-Match`)
 - [ ] WebSocket upgrade capability
 - [ ] HTTP/2 or HTTP/3 protocol support
 - [ ] SSL/TLS encryption layer
 - [ ] Authentication mechanisms (Basic, Digest, Bearer)
 - [ ] CORS headers for cross-origin requests
-- [ ] Security headers (HSTS, CSP, X-Frame-Options)
+- [ ] Advanced request filtering (SQL injection, path traversal protection)
 
 ## Technical Implementation Notes
 
