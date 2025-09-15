@@ -1,0 +1,32 @@
+{
+    "server": {
+        "name": "CustomWebServer",
+        "version": "1.0",
+        "author": "Built from scratch",
+        "language": "C",
+        "features": [
+            "Raw TCP sockets",
+            "HTTP/1.1 protocol",
+            "Header parsing",
+            "MIME type detection",
+            "File serving",
+            "Error handling",
+            "Concurrent connections"
+        ]
+    },
+    "endpoints": {
+        "GET": [
+            "/",
+            "/index.html", 
+            "/test.html",
+            "/style.css",
+            "/script.js",
+            "/data.json"
+        ],
+        "POST": [
+            "/"
+        ]
+    },
+    "status": "running",
+    "timestamp": "2025-09-13"
+}
