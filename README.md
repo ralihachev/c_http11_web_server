@@ -16,39 +16,46 @@ A high-performance HTTP/1.1 web server implementation written from scratch in C,
 The server is organized into several logical layers:
 
 ### 1. Network Layer (`webserver.c:111-190`)
+
 - **Socket Management**: Creation, binding, and listening with proper error handling
 - **Connection Handling**: Accept incoming connections with configurable backlog
 - **Socket Options**: Buffer size optimization, address reuse, and keep-alive settings
 
 ### 2. Threading Layer (`webserver.c:192-199`, `webserver.c:651-694`)
+
 - **Thread Pool**: Dynamic thread creation for each client connection
 - **Resource Management**: Automatic cleanup and thread detachment
 - **Concurrency Control**: Thread-safe operations with proper synchronization
 
 ### 3. HTTP Protocol Layer (`webserver.c:304-359`)
+
 - **Request Parsing**: Complete HTTP request line and header processing
 - **Keep-Alive Detection**: Connection persistence based on HTTP version and headers
 - **Method Support**: GET, HEAD, and POST method handling
 
 ### 4. MIME Type System (`webserver.c:44-59`, `webserver.c:536-553`)
+
 - **Content Type Detection**: File extension to MIME type mapping
-- **Supported Formats**: 
+- **Supported Formats**:
   - Web: HTML, CSS, JavaScript, JSON
   - Images: PNG, JPEG, GIF, SVG, ICO
   - Documents: PDF, ZIP, plain text
   - Default: application/octet-stream
 
 ### 5. File Serving Layer (`webserver.c:453-496`)
+
 - **File System Access**: Safe file operations with proper validation
 - **Content Delivery**: Efficient file reading and transmission
 - **Error Handling**: File not found, permission, and I/O error management
 
 ### 6. Response Generation Layer (`webserver.c:385-533`)
+
 - **HTTP Response Format**: Standards-compliant response headers and body
 - **Status Code Management**: Appropriate error responses with HTML content
 - **Safe Transmission**: Partial send handling and network error recovery
 
 ### 7. Utility Layer (`webserver.c:555-598`)
+
 - **URL Decoding**: Percent-encoding and plus-space conversion
 - **Time Formatting**: HTTP-compliant GMT timestamp generation
 - **Signal Handling**: Graceful shutdown and process cleanup
@@ -68,50 +75,59 @@ c_web_server/
 
 ## Configuration Constants
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `PORT` | 3000 | Default server port |
-| `BUFFER_SIZE` | 8192 | I/O buffer size |
-| `MAX_PATH` | 512 | Maximum file path length |
-| `MAX_HEADERS` | 20 | Maximum HTTP headers per request |
-| `MAX_HEADER_SIZE` | 512 | Maximum header value size |
-| `MAX_CONNECTIONS` | 50 | Listen queue backlog |
+| Constant          | Value | Purpose                          |
+| ----------------- | ----- | -------------------------------- |
+| `PORT`            | 3000  | Default server port              |
+| `BUFFER_SIZE`     | 8192  | I/O buffer size                  |
+| `MAX_PATH`        | 512   | Maximum file path length         |
+| `MAX_HEADERS`     | 20    | Maximum HTTP headers per request |
+| `MAX_HEADER_SIZE` | 512   | Maximum header value size        |
+| `MAX_CONNECTIONS` | 50    | Listen queue backlog             |
 
 ## Data Structures
 
 ### `http_request_t`
+
 Complete HTTP request representation with method, path, version, headers, and body.
 
 ### `client_connection_t`
+
 Client connection tracking with socket descriptor, address, and timestamp.
 
 ### `mime_type_t`
+
 File extension to MIME type mapping structure.
 
 ### `http_header_t`
+
 Individual HTTP header with name-value pairs.
 
 ## Compilation
 
 ```bash
-gcc -o webserver webserver.c -pthread
+gcc -o webserver webserver.c -pthread -lz
 ```
 
 ## Usage
 
 ### Basic Usage
+
 ```bash
 ./webserver
 ```
+
 Server starts on port 3000: http://localhost:3000
 
 ### Custom Port
+
 ```bash
 ./webserver 8080
 ```
+
 Server starts on specified port: http://localhost:8080
 
 ### Graceful Shutdown
+
 Press `Ctrl+C` to stop the server gracefully.
 
 ## Supported HTTP Methods
@@ -155,27 +171,31 @@ The project includes several test files to demonstrate functionality:
 
 ## HTTP Protocol Compliance Analysis
 
-This server implements **4 out of 7** core HTTP protocol layers (~60-70% compliance):
+This server implements **6 out of 7** core HTTP protocol layers (~85% compliance):
 
 ### ✅ **Implemented Layers**
-- ~~**HTTP Message Layer** (`webserver.c:304-359`)~~ - Request/response parsing, headers, body handling
+
+- ~~**HTTP Message Layer** (`webserver.c:304-395`)~~ - Request/response parsing, headers, body handling
 - ~~**HTTP Method Layer** (`webserver.c:241-290`)~~ - GET, HEAD, POST support with validation
-- ~~**HTTP Status Layer** (`webserver.c:499-533`)~~ - 200, 400, 404, 500 status codes
+- ~~**HTTP Status Layer** (`webserver.c:805-847`)~~ - 200, 400, 404, 406, 500 status codes
 - ~~**Connection Management** (`webserver.c:238-297`)~~ - HTTP/1.1 keep-alive, persistent connections
+- ~~**Content-Type Layer** (`webserver.c:466-543`)~~ - MIME detection + content negotiation (Accept headers)
+- ~~**Content Encoding Layer** (`webserver.c:545-620`, `webserver.c:733-802`)~~ - gzip compression with quality parsing
 
 ### 🔄 **Partially Implemented**
-- **Content-Type Layer** - ~~MIME detection~~ but missing content negotiation
-- **HTTP Headers** - ~~Basic parsing/generation~~ but missing advanced headers
+
+- **HTTP Headers** - ~~Basic parsing/generation~~ but missing some advanced headers (Range, etc.)
 
 ### ❌ **Missing Layers**
-- [ ] **Content Encoding Layer** - Compression (gzip, deflate), chunked transfer
+
 - [ ] **Caching Layer** - Cache-Control, ETag, Last-Modified, conditional requests
 - [ ] **Security/Auth Layer** - HTTPS/TLS, authentication, CORS, security headers
 
 ### 🚧 **Future Enhancement Opportunities**
+
 - [ ] Range requests for partial content (`Range: bytes=0-1023`)
-- [ ] Content negotiation (`Accept`, `Accept-Language` headers)  
-- [ ] Request/response compression for bandwidth optimization
+- ~~Content negotiation (`Accept`, `Accept-Language` headers)~~ ✅ **IMPLEMENTED**
+- ~~Request/response compression for bandwidth optimization~~ ✅ **IMPLEMENTED**
 - [ ] Conditional requests (`If-Modified-Since`, `If-None-Match`)
 - [ ] WebSocket upgrade capability
 - [ ] HTTP/2 or HTTP/3 protocol support
