@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <zlib.h>
 #include <ctype.h>
+#include <regex.h>
 
 #define PORT 3000
 #define BUFFER_SIZE 8192
@@ -21,6 +22,8 @@
 #define MAX_HEADERS 20
 #define MAX_HEADER_SIZE 512
 #define MAX_CONNECTIONS 50
+#define MAX_COMPRESSION_FILE_SIZE (5 * 1024 * 1024) // 5MB limit for compression
+#define MAX_THREADS 100                             // Maximum number of concurrent threads
 
 // HTTP Status Codes
 #define HTTP_200 "200 OK"
@@ -57,6 +60,7 @@ mime_type_t mime_types[] = {
     {".ico", "image/x-icon"},
     {".svg", "image/svg+xml"},
     {".txt", "text/plain"},
+    {".xml", "application/xml"},
     {".pdf", "application/pdf"},
     {".zip", "application/zip"},
     {NULL, "application/octet-stream"}};
@@ -122,8 +126,10 @@ typedef struct
     time_t window_start;
     int request_count;
     time_t last_request;
-    int blocked_until;   // Temporary ban timestamp
-    int violation_count; // Number of violations from this IP
+    time_t blocked_until; // Temporary ban timestamp
+    int violation_count;  // Number of violations from this IP
+    int burst_count;
+    time_t burst_second;
 } rate_limit_entry_t;
 
 typedef struct
@@ -169,8 +175,10 @@ typedef struct
     char pattern[256];
     security_action_t action;
     char description[256];
-    int ban_duration;   // if the action is ban
-    int case_sensitive; // case sensitive matching
+    int ban_duration;       // if the action is ban
+    int case_sensitive;     // case sensitive matching
+    regex_t compiled_regex; // cached compiled regex pattern
+    int regex_compiled;     // flag to track if regex is compiled
 } security_rule_t;
 
 typedef struct
@@ -189,6 +197,24 @@ typedef struct
     char threat_type[128];
     char matched_pattern[128];
 } security_check_result_t;
+
+// Memory Pool Structures for Performance Optimization
+typedef struct memory_pool_block
+{
+    void *data;
+    int in_use;
+    struct memory_pool_block *next;
+} memory_pool_block_t;
+
+typedef struct
+{
+    size_t block_size;
+    int pool_size;
+    int blocks_allocated;
+    int blocks_in_use;
+    memory_pool_block_t *free_list;
+    pthread_mutex_t mutex;
+} memory_pool_t;
 
 // route handler function pointer
 typedef struct api_response (*route_handler_t)(http_request_t *req, struct api_response *res);
@@ -237,6 +263,13 @@ rate_limit_config_t *global_rate_limit_config = NULL;
 security_filter_t *global_security_filter = NULL;
 router_t *api_router = NULL;
 
+// Global memory pools
+memory_pool_t *connection_pool = NULL;
+
+// Thread management for resource exhaustion protection
+static volatile int active_thread_count = 0;
+static pthread_mutex_t thread_count_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Function prototypes
 int create_socket();
 int bind_socket(int sockfd, int port);
@@ -251,7 +284,7 @@ void send_400(int client_fd, int keep_alive);
 void send_500(int client_fd, int keep_alive);
 char *get_mime_type(char *filepath);
 void get_current_time(char *buffer);
-void url_decode(char *dst, const char *src);
+void url_decode(char *dst, const char *src, size_t dst_size);
 void handle_sigchld(int sig);
 void setup_socket_options(int sockfd);
 int safe_send(int sockfd, const void *buf, size_t len);
@@ -259,7 +292,7 @@ int safe_send_file(int client_fd, int file_fd, size_t file_size);
 float parse_quality(char *header_value, char *target_value);
 negotiated_content_t negotiate_content(char *filepath, http_request_t *request);
 int compress_gzip(const char *input, size_t input_len, char **output, size_t *output_len);
-int should_compress_content(const char *content_type, size_t contnet_length);
+int should_compress_content(const char *content_type, size_t content_length);
 security_headers_t get_default_security_headers();
 void add_security_headers(char *response_buffer, size_t buffer_size, int *header_length, security_headers_t *security_config, int is_https);
 rate_limit_config_t *init_rate_limiting();
@@ -271,6 +304,7 @@ void send_ban_response(int client_fd, const char *client_ip, int ban_remaining);
 void cleanup_rate_limiting(rate_limit_config_t *config);
 security_filter_t *init_security_filter();
 int add_security_rule(security_filter_t *filter, const char *pattern, security_action_t action, const char *description, int ban_duration, int case_sensitive);
+void cleanup_security_filter(security_filter_t *filter);
 security_check_result_t validate_request_security(security_filter_t *filter, const char *request_uri, const char *user_agent, const char *request_body);
 int validate_file_path(const char *requested_path, char *safe_path, size_t safe_path_len);
 void send_security_block_response(int client_fd, const char *threat_type);
@@ -290,16 +324,21 @@ char *get_param(http_request_t *request, const char *param_name);
 void extract_url_params(const char *route_path, const char *request_path, http_request_t *request);
 const char *get_status_text(int status_code);
 
+// Memory pool management functions
+memory_pool_t *create_memory_pool(size_t block_size, int pool_size);
+void *pool_allocate(memory_pool_t *pool);
+void pool_deallocate(memory_pool_t *pool, void *ptr);
+void destroy_memory_pool(memory_pool_t *pool);
+
 // Global variables for graceful shutdown
 volatile sig_atomic_t server_running = 1;
 
 void handle_sigint(int sig)
 {
     (void)sig;
-    printf("\n[INFO] Received shutdown signal. Stopping server...\n");
+    // Only async-signal-safe operations allowed in signal handlers
+    // Just set the flag - cleanup will happen in main loop
     server_running = 0;
-    cleanup_rate_limiting(global_rate_limit_config);
-    exit(0);
 }
 
 void cleanup_rate_limiting(rate_limit_config_t *config)
@@ -307,10 +346,152 @@ void cleanup_rate_limiting(rate_limit_config_t *config)
     if (config)
     {
         pthread_mutex_destroy(&config->mutex);
-        free(config->entries);
+        if (config->entries)
+        {
+            free(config->entries);
+            config->entries = NULL; // Prevent double-free
+        }
         free(config);
         printf("[INFO] Rate limiting cleanup completed\n");
     }
+}
+
+// Memory Pool Implementation for Performance Optimization
+memory_pool_t *create_memory_pool(size_t block_size, int pool_size)
+{
+    memory_pool_t *pool = malloc(sizeof(memory_pool_t));
+    if (!pool)
+        return NULL;
+
+    pool->block_size = block_size;
+    pool->pool_size = pool_size;
+    pool->blocks_allocated = 0;
+    pool->blocks_in_use = 0;
+    pool->free_list = NULL;
+
+    if (pthread_mutex_init(&pool->mutex, NULL) != 0)
+    {
+        free(pool);
+        return NULL;
+    }
+
+    // Pre-allocate pool blocks
+    for (int i = 0; i < pool_size; i++)
+    {
+        memory_pool_block_t *block = malloc(sizeof(memory_pool_block_t));
+        if (!block)
+            break;
+
+        block->data = malloc(block_size);
+        if (!block->data)
+        {
+            free(block);
+            break;
+        }
+
+        block->in_use = 0;
+        block->next = pool->free_list;
+        pool->free_list = block;
+        pool->blocks_allocated++;
+    }
+
+    printf("[INFO] Memory pool created: %d blocks of %zu bytes each\n",
+           pool->blocks_allocated, block_size);
+    return pool;
+}
+
+void *pool_allocate(memory_pool_t *pool)
+{
+    if (!pool)
+        return NULL;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    if (!pool->free_list)
+    {
+        pthread_mutex_unlock(&pool->mutex);
+        return NULL; // Pool exhausted
+    }
+
+    memory_pool_block_t *block = pool->free_list;
+    pool->free_list = block->next;
+    block->in_use = 1;
+    block->next = NULL;
+    pool->blocks_in_use++;
+
+    pthread_mutex_unlock(&pool->mutex);
+    return block->data;
+}
+
+void pool_deallocate(memory_pool_t *pool, void *ptr)
+{
+    if (!pool || !ptr)
+        return;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    // Find the block that contains this data
+    memory_pool_block_t *current = pool->free_list;
+    memory_pool_block_t *prev = NULL;
+
+    // Check free list first (shouldn't find it here)
+    while (current)
+    {
+        if (current->data == ptr)
+        {
+            // This is an error - double free
+            pthread_mutex_unlock(&pool->mutex);
+            printf("[ERROR] Double free detected in memory pool\n");
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+
+    // Search through all allocated blocks to find the one to free
+    // In a real implementation, we'd maintain a separate list of allocated blocks
+    // For simplicity, we'll create a new block structure
+    memory_pool_block_t *block = malloc(sizeof(memory_pool_block_t));
+    if (!block)
+    {
+        pthread_mutex_unlock(&pool->mutex);
+        return;
+    }
+
+    block->data = ptr;
+    block->in_use = 0;
+    block->next = pool->free_list;
+    pool->free_list = block;
+    pool->blocks_in_use--;
+
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+void destroy_memory_pool(memory_pool_t *pool)
+{
+    if (!pool)
+        return;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    memory_pool_block_t *current = pool->free_list;
+    while (current)
+    {
+        memory_pool_block_t *next = current->next;
+        free(current->data);
+        free(current);
+        current = next;
+    }
+
+    pool->free_list = NULL;
+    pool->blocks_allocated = 0;
+    pool->blocks_in_use = 0;
+
+    pthread_mutex_unlock(&pool->mutex);
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+
+    printf("[INFO] Memory pool destroyed\n");
 }
 
 // Create socket with error handling
@@ -359,6 +540,21 @@ void setup_socket_options(int sockfd)
     {
         perror("Warning: setsockopt SO_KEEPALIVE failed");
     }
+
+    // Set socket timeouts to prevent hanging connections
+    struct timeval timeout;
+    timeout.tv_sec = 30; // 30 second timeout
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        perror("Warning: setsockopt SO_RCVTIMEO failed");
+    }
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        perror("Warning: setsockopt SO_SNDTIMEO failed");
+    }
 }
 
 // Bind socket to address and port
@@ -398,15 +594,35 @@ int listen_socket(int sockfd)
 void *handle_client_thread(void *arg)
 {
     client_connection_t *conn = (client_connection_t *)arg;
-    handle_client(conn->client_fd, conn->client_addr);
-    free(conn);
+
+    // Extract values locally to avoid use-after-free
+    int client_fd = conn->client_fd;
+    struct sockaddr_in client_addr = conn->client_addr;
+
+    // Free the connection structure immediately after copying data
+    if (connection_pool)
+    {
+        pool_deallocate(connection_pool, conn);
+    }
+    else
+    {
+        free(conn);
+    }
+
+    // Handle the client using local copies
+    handle_client(client_fd, client_addr);
+
+    // Decrement active thread count when thread is about to exit
+    pthread_mutex_lock(&thread_count_mutex);
+    active_thread_count--;
+    pthread_mutex_unlock(&thread_count_mutex);
+
     return NULL;
 }
 
 // client handling with connection management
 void handle_client(int client_fd, struct sockaddr_in client_addr)
 {
-    // check limits before processing the request
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
 
@@ -418,13 +634,12 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
         {
         case RATE_LIMIT_BAN:
         {
-            // Find entry to get remaining ban time
             pthread_mutex_lock(&global_rate_limit_config->mutex);
             for (int i = 0; i < global_rate_limit_config->entry_count; i++)
             {
                 if (strcmp(global_rate_limit_config->entries[i].client_ip, client_ip) == 0)
                 {
-                    int remaining = global_rate_limit_config->entries[i].blocked_until - time(NULL);
+                    int remaining = (int)(global_rate_limit_config->entries[i].blocked_until - time(NULL));
                     pthread_mutex_unlock(&global_rate_limit_config->mutex);
                     send_ban_response(client_fd, client_ip, remaining);
                     close(client_fd);
@@ -448,11 +663,10 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
             break;
         }
 
-        // check for DDoS patterns periodically
         static time_t last_ddos_check = 0;
         time_t now = time(NULL);
         if (now - last_ddos_check >= 30)
-        { // Check every 30 seconds
+        {
             detect_ddos_pattern(global_rate_limit_config);
             last_ddos_check = now;
         }
@@ -464,12 +678,21 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
 
     printf("[INFO] Handling client %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
+    // Resolve docroot once per client connection (fail early if docroot missing)
+    char docroot[MAX_PATH];
+    if (!realpath("./client", docroot))
+    {
+        printf("[ERROR] Failed to resolve document root directory\n");
+        send_500(client_fd, 0);
+        close(client_fd);
+        return;
+    }
+
     while (keep_connection && server_running)
     {
         memset(buffer, 0, sizeof(buffer));
         memset(&request, 0, sizeof(request));
 
-        // Read request with timeout
         ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
         if (bytes_read <= 0)
         {
@@ -487,15 +710,11 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
         buffer[bytes_read] = '\0';
         printf("[DEBUG] Received %zd bytes\n", bytes_read);
 
-        // Parse the HTTP request
         parse_request(buffer, &request);
 
-        printf("[INFO] %s %s %s\n", request.method, request.path, request.version);
-
-        // process security validation
+        // security validation
         if (global_security_filter)
         {
-            // Extract user agent from request headers
             char *user_agent = NULL;
             for (int i = 0; i < request.header_count; i++)
             {
@@ -506,7 +725,6 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
                 }
             }
 
-            // Validate request for security threats
             security_check_result_t security_result = validate_request_security(
                 global_security_filter, request.path, user_agent, request.body);
 
@@ -514,13 +732,21 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
             {
                 if (security_result.should_ban)
                 {
-                    // Add IP to rate limiting ban list
-                    pthread_mutex_lock(&global_rate_limit_config->mutex);
-                    rate_limit_entry_t *entry = find_or_create_entry(global_rate_limit_config, client_ip);
-                    entry->blocked_until = time(NULL) + security_result.ban_duration;
-                    entry->violation_count += 10; // Heavy penalty for security violations
-                    pthread_mutex_unlock(&global_rate_limit_config->mutex);
-
+                    if (global_rate_limit_config)
+                    {
+                        pthread_mutex_lock(&global_rate_limit_config->mutex);
+                        rate_limit_entry_t *entry = find_or_create_entry(global_rate_limit_config, client_ip);
+                        if (entry)
+                        {
+                            entry->blocked_until = time(NULL) + security_result.ban_duration;
+                            entry->violation_count += 10;
+                        }
+                        else
+                        {
+                            printf("[ERROR] Failed to create rate limit entry for security ban: %s\n", client_ip);
+                        }
+                        pthread_mutex_unlock(&global_rate_limit_config->mutex);
+                    }
                     send_ban_response(client_fd, client_ip, security_result.ban_duration);
                 }
                 else
@@ -532,86 +758,115 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
             }
         }
 
-        // Check for keep-alive
         keep_connection = request.keep_alive;
 
-        if (strncmp(request.path, "/api/", 5) == 0)
+        if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
         {
-            // Handle API request
-            handle_api_request(&request, client_fd, api_router);
-        }
-        else
-        {
-            // Handle different HTTP methods
-            if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
+            printf("[INFO] received request path: %s\n", request.path);
+
+            // Build a relative path under docroot WITHOUT duplicating "client/"
+            // relative_path never contains "client/" prefix
+            char relative_path[MAX_PATH] = {0};
+
+            // Special routing (maps to files inside docroot)
+            if (strcmp(request.path, "/") == 0)
             {
-                // Normalize path
-                if (strcmp(request.path, "/") == 0)
-                {
-                    strcpy(request.path, "/index.html");
-                }
-
-                // Construct file path (remove leading slash)
-                char filepath[MAX_PATH];
-                snprintf(filepath, sizeof(filepath), ".%s", request.path);
-
-                // URL decode
-                char decoded_path[MAX_PATH];
-                url_decode(decoded_path, filepath);
-                strcpy(filepath, decoded_path);
-
-                // Validate and sanitize file path
-                char safe_filepath[MAX_PATH];
-                if (validate_file_path(request.path, safe_filepath, sizeof(safe_filepath)) < 0)
-                {
-                    send_security_block_response(client_fd, "PATH_TRAVERSAL");
-                    close(client_fd);
-                    return;
-                }
-
-                // Use safe_filepath instead of original request.path for file operations
-                strcpy(filepath, safe_filepath);
-                printf("[INFO] Serving safe file: %s\n", filepath);
-
-                if (strcmp(request.method, "HEAD") == 0)
-                {
-                    // HEAD request - send headers only
-                    struct stat file_stat;
-                    if (stat(filepath, &file_stat) == 0 && S_ISREG(file_stat.st_mode))
-                    {
-                        negotiated_content_t content = negotiate_content(filepath, &request);
-                        send_response(client_fd, HTTP_200, &content, NULL, file_stat.st_size, keep_connection);
-                    }
-                    else
-                    {
-                        send_404(client_fd, keep_connection);
-                    }
-                }
-                else
-                {
-                    // GET request - send full response
-                    send_file(client_fd, filepath, keep_connection, &request);
-                }
+                snprintf(relative_path, sizeof(relative_path), "index.html");
             }
-            else if (strcmp(request.method, "POST") == 0)
+            else if (strcmp(request.path, "/about") == 0)
             {
-                char *response_body = "POST request received successfully";
-                negotiated_content_t post_content = {0};
-                strcpy(post_content.content_type, "text/plain");
-                strcpy(post_content.charset, "utf-8");
-                send_response(client_fd, HTTP_200, &post_content, response_body, strlen(response_body), keep_connection);
+                snprintf(relative_path, sizeof(relative_path), "about.html");
+            }
+            else if (strcmp(request.path, "/blog") == 0 || strcmp(request.path, "/blog/") == 0)
+            {
+                snprintf(relative_path, sizeof(relative_path), "blog.html");
+            }
+            else if (strncmp(request.path, "/blog/", 6) == 0)
+            {
+                // /blog/post -> dist/blog/post.html
+                char tmp[MAX_PATH];
+                snprintf(tmp, sizeof(tmp), "dist/blog/%s.html", request.path + 6);
+                snprintf(relative_path, sizeof(relative_path), "%s", tmp);
+            }
+            else if (strcmp(request.path, "/sitemap.xml") == 0)
+            {
+                snprintf(relative_path, sizeof(relative_path), "sitemap.xml");
             }
             else
             {
-                send_400(client_fd, keep_connection);
-                keep_connection = 0; // Close connection on bad request
+                // Generic: strip leading slash
+                const char *p = request.path;
+                if (*p == '/')
+                    p++;
+
+                // If the incoming path starts with "client/" remove that prefix.
+                if (strncmp(p, "client/", 7) == 0)
+                    p += 7;
+
+                // copy remaining into relative_path (prevent overflow)
+                snprintf(relative_path, sizeof(relative_path), "%s", p);
             }
 
-            // For HTTP/1.0 or if Connection: close, don't keep alive
-            if (strstr(request.version, "1.0") || !keep_connection)
+            // Use secure path validation function
+            char safe_file_path[MAX_PATH];
+            int validation_result = validate_file_path(relative_path, safe_file_path, sizeof(safe_file_path));
+
+            if (validation_result == -1)
             {
-                break;
+                // Path traversal attempt detected - log to server only
+                printf("[SECURITY] Path traversal attempt blocked\n");
+                send_security_block_response(client_fd, "PATH_TRAVERSAL");
+                close(client_fd);
+                return;
             }
+            else if (validation_result != 0)
+            {
+                // Other validation error (buffer overflow, etc.) - generic message
+                printf("[SECURITY] Path validation failed\n");
+                send_500(client_fd, keep_connection);
+                if (!keep_connection)
+                    break;
+                continue;
+            }
+
+            printf("[INFO] Serving safe file: %s\n", safe_file_path);
+
+            if (strcmp(request.method, "HEAD") == 0)
+            {
+                struct stat file_stat;
+                if (stat(safe_file_path, &file_stat) == 0 && S_ISREG(file_stat.st_mode))
+                {
+                    negotiated_content_t content = negotiate_content(safe_file_path, &request);
+                    send_response(client_fd, HTTP_200, &content, NULL, file_stat.st_size, keep_connection);
+                }
+                else
+                {
+                    send_404(client_fd, keep_connection);
+                }
+            }
+            else
+            {
+                send_file(client_fd, safe_file_path, keep_connection, &request);
+            }
+        }
+        else if (strcmp(request.method, "POST") == 0)
+        {
+            char *response_body = "POST request received successfully";
+            negotiated_content_t post_content = {0};
+            snprintf(post_content.content_type, sizeof(post_content.content_type), "%s", "text/plain");
+            snprintf(post_content.charset, sizeof(post_content.charset), "%s", "utf-8");
+
+            send_response(client_fd, HTTP_200, &post_content, response_body, strlen(response_body), keep_connection);
+        }
+        else
+        {
+            send_400(client_fd, keep_connection);
+            keep_connection = 0;
+        }
+
+        if (strstr(request.version, "1.0") || !keep_connection)
+        {
+            break;
         }
     }
 
@@ -651,13 +906,27 @@ void parse_request(char *raw_request, http_request_t *request)
         if (colon != NULL)
         {
             *colon = '\0';
-            strcpy(request->headers[request->header_count].name, line);
+
+            // Validate header name (basic checks)
+            if (strlen(line) == 0 || strlen(line) > MAX_HEADER_SIZE - 1)
+            {
+                continue; // Skip invalid header names
+            }
+
+            snprintf(request->headers[request->header_count].name, sizeof(request->headers[request->header_count].name), "%s", line);
 
             // Skip whitespace after colon
             char *value = colon + 1;
             while (*value == ' ')
                 value++;
-            strcpy(request->headers[request->header_count].value, value);
+
+            // Validate header value length
+            if (strlen(value) > MAX_HEADER_SIZE - 1)
+            {
+                continue; // Skip oversized header values
+            }
+
+            snprintf(request->headers[request->header_count].value, sizeof(request->headers[request->header_count].value), "%s", value);
 
             // Check for Connection header
             if (strcasecmp(line, "Connection") == 0)
@@ -673,19 +942,19 @@ void parse_request(char *raw_request, http_request_t *request)
             }
             if (strcasecmp(line, "Accept") == 0)
             {
-                strcpy(request->accept, value);
+                snprintf(request->accept, sizeof(request->accept), "%s", value);
             }
             if (strcasecmp(line, "Accept-Language") == 0)
             {
-                strcpy(request->accept_language, value);
+                snprintf(request->accept_language, sizeof(request->accept_language), "%s", value);
             }
             if (strcasecmp(line, "Accept-Encoding") == 0)
             {
-                strcpy(request->accept_encoding, value);
+                snprintf(request->accept_encoding, sizeof(request->accept_encoding), "%s", value);
             }
             if (strcasecmp(line, "Accept-Charset") == 0)
             {
-                strcpy(request->accept_charset, value);
+                snprintf(request->accept_charset, sizeof(request->accept_charset), "%s", value);
             }
             request->header_count++;
         }
@@ -694,13 +963,40 @@ void parse_request(char *raw_request, http_request_t *request)
 
 float parse_quality(char *header_value, char *target_type)
 {
-    if (strlen(header_value) == 0)
+    if (!header_value || strlen(header_value) == 0)
     {
         return 1.0; // default if no accept header
     }
 
-    char *header_copy = malloc(strlen(header_value) + 1);
-    strcpy(header_copy, header_value);
+    size_t len = strlen(header_value);
+
+    // Prevent excessive memory allocation - limit header size to reasonable maximum
+    const size_t MAX_HEADER_LENGTH = BUFFER_SIZE; // 8KB should be sufficient for Accept headers
+    if (len > MAX_HEADER_LENGTH)
+    {
+        printf("[SECURITY] Rejecting oversized header: %zu bytes (max: %zu)\n", len, MAX_HEADER_LENGTH);
+        return 0.0; // reject oversized headers
+    }
+
+    // Use stack allocation for small headers, fallback to malloc for large ones
+    char stack_buffer[4096]; // 4KB stack buffer for most common cases
+    char *header_copy;
+    int use_stack = (len < sizeof(stack_buffer));
+
+    if (use_stack)
+    {
+        header_copy = stack_buffer;
+    }
+    else
+    {
+        header_copy = malloc(len + 1);
+        if (!header_copy)
+        {
+            return 0.0; // allocation failed, safest fallback
+        }
+    }
+
+    snprintf(header_copy, len + 1, "%s", header_value);
 
     char *token = strtok(header_copy, ",");
     float best_quality = 0.0;
@@ -714,30 +1010,32 @@ float parse_quality(char *header_value, char *target_type)
         }
 
         char media_type[64] = {0};
-        float quality = 1.0; // default quality
+        float quality = 1.0f; // default quality
+
         // split on ; to separate media type from parameters
         char *semicolon = strchr(token, ';');
         if (semicolon != NULL)
         {
             *semicolon = '\0';
-            strcpy(media_type, token);
+            snprintf(media_type, sizeof(media_type), "%s", token);
 
             // parse quality parameter
             char *q_param = strstr(semicolon + 1, "q=");
             if (q_param != NULL)
             {
-                quality = atof(q_param + 2);
+                quality = (float)atof(q_param + 2);
             }
         }
         else
         {
-            strcpy(media_type, token);
+            snprintf(media_type, sizeof(media_type), "%s", token);
         }
 
         // check if this media type matches our target
         if (strcmp(media_type, target_type) == 0 ||
             strcmp(media_type, "*/*") == 0 ||
-            (strstr(target_type, "/") && strncmp(media_type, target_type, strchr(target_type, '/') - target_type) == 0 &&
+            (strstr(target_type, "/") &&
+             strncmp(media_type, target_type, strchr(target_type, '/') - target_type) == 0 &&
              strcmp(strchr(media_type, '/'), "/*") == 0))
         {
             if (quality > best_quality)
@@ -749,7 +1047,11 @@ float parse_quality(char *header_value, char *target_type)
         token = strtok(NULL, ",");
     }
 
-    free(header_copy);
+    // Only free if we used malloc
+    if (!use_stack)
+    {
+        free(header_copy);
+    }
     return best_quality;
 }
 
@@ -757,11 +1059,11 @@ float parse_quality(char *header_value, char *target_type)
 negotiated_content_t negotiate_content(char *filepath, http_request_t *request)
 {
     negotiated_content_t result = {0};
-    strcpy(result.charset, "utf-8"); // default charset
+    snprintf(result.charset, sizeof(result.charset), "%s", "utf-8");
 
     // get base MIME type from file extension
     char *base_mime = get_mime_type(filepath);
-    strcpy(result.content_type, base_mime);
+    snprintf(result.content_type, sizeof(result.content_type), "%s", base_mime);
 
     printf("[DEBUG] File: %s, Base MIME: %s\n", filepath, base_mime);
     printf("[DEBUG] Accept header: '%s'\n", request->accept);
@@ -773,7 +1075,7 @@ negotiated_content_t negotiate_content(char *filepath, http_request_t *request)
         if (quality == 0)
         {
             // client does not accept this tpye, we should try alternatives but for now we can keep original - should be improved
-            strcpy(result.content_type, "application/octet-stream");
+            snprintf(result.content_type, sizeof(result.content_type), "%s", "application/octet-stream");
         }
     }
 
@@ -794,7 +1096,7 @@ negotiated_content_t negotiate_content(char *filepath, http_request_t *request)
                 struct stat lang_stat;
                 if (stat(lang_filepath, &lang_stat) == 0)
                 {
-                    strcpy(result.language, languages[i]);
+                    snprintf(result.language, sizeof(result.language), "%s", languages[i]);
                     break;
                 }
             }
@@ -807,12 +1109,12 @@ negotiated_content_t negotiate_content(char *filepath, http_request_t *request)
         // check for compression support
         if (parse_quality(request->accept_encoding, "gzip") > 0.0)
         {
-            strcpy(result.encoding, "gzip");
+            snprintf(result.encoding, sizeof(result.encoding), "%s", "gzip");
             result.should_compress = 1;
         }
         else if (parse_quality(request->accept_encoding, "deflate") > 0.0)
         {
-            strcpy(result.encoding, "deflate");
+            snprintf(result.encoding, sizeof(result.encoding), "%s", "deflate");
             result.should_compress = 1;
         }
     }
@@ -822,11 +1124,11 @@ negotiated_content_t negotiate_content(char *filepath, http_request_t *request)
     {
         if (parse_quality(request->accept_charset, "utf-8") > 0.0)
         {
-            strcpy(result.charset, "utf-8");
+            snprintf(result.charset, sizeof(result.charset), "%s", "utf-8");
         }
         else if (parse_quality(request->accept_charset, "iso-8859-1") > 0.0)
         {
-            strcpy(result.charset, "iso-8859-1");
+            snprintf(result.charset, sizeof(result.charset), "%s", "iso-8859-1");
         }
     }
 
@@ -835,10 +1137,14 @@ negotiated_content_t negotiate_content(char *filepath, http_request_t *request)
 
 int compress_gzip(const char *input, size_t input_len, char **output, size_t *output_len)
 {
-    if (input == NULL || input_len == 0)
+    if (input == NULL || input_len == 0 || output == NULL || output_len == NULL)
     {
         return -1;
     }
+
+    // Initialize output pointer to NULL for safety
+    *output = NULL;
+    *output_len = 0;
 
     // allocate output buffer: input size + 0.1% + 12 bytes;
     size_t max_output_len = input_len + (input_len * 0.001) + 12 + 18; // gzip header and footer
@@ -857,6 +1163,7 @@ int compress_gzip(const char *input, size_t input_len, char **output, size_t *ou
     if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
     {
         free(*output);
+        *output = NULL;
         return -1;
     }
 
@@ -870,6 +1177,7 @@ int compress_gzip(const char *input, size_t input_len, char **output, size_t *ou
     {
         deflateEnd(&strm);
         free(*output);
+        *output = NULL;
         return -1;
     }
 
@@ -919,10 +1227,14 @@ security_headers_t get_default_security_headers()
     headers.enable_xss_protection = 1;
     headers.enable_content_type_options = 1;
     headers.enable_frame_options = 1;
-    strcpy(headers.frame_options, "SAMEORIGIN");
+    snprintf(headers.frame_options, sizeof(headers.frame_options), "%s", "SAMEORIGIN");
 
     // basic csp - allows same origin, inline styles, but restricts scripts
-    strcpy(headers.csp_policy, "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'");
+    /*strcpy(headers.csp_policy,
+           "default-src 'self'; "
+           "img-src 'self' https: data:; "
+           "style-src 'self' https: 'unsafe-inline'; "
+           "script-src 'self' https://www.googletagmanager.com https://www.google-analytics.com 'sha256-CixLfa7WgyJXPMQDCl15d/FBZpN8gUqAInEA45xlO9o=';");*/
     headers.enable_csp = 1;
 
     // hsts disabled by default - only enable with HTTPS
@@ -940,7 +1252,7 @@ void add_security_headers(char *response_buffer, size_t buffer_size, int *header
     // prevent mime type sniffing
     if (security_config->enable_content_type_options)
     {
-        strcpy(temp_header, "X-Content-Type-Options: nosniff\r\n");
+        snprintf(temp_header, sizeof(temp_header), "%s", "X-Content-Type-Options: nosniff\r\n");
         if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
         {
             strcat(response_buffer, temp_header);
@@ -963,7 +1275,8 @@ void add_security_headers(char *response_buffer, size_t buffer_size, int *header
     // enable xss filtering
     if (security_config->enable_xss_protection)
     {
-        strcpy(temp_header, "X-XSS-Protection: 1; mode=block\r\n");
+        snprintf(temp_header, sizeof(temp_header), "%s", "X-XSS-Protection: 1; mode=block\r\n");
+
         if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
         {
             strcat(response_buffer, temp_header);
@@ -1001,14 +1314,16 @@ void add_security_headers(char *response_buffer, size_t buffer_size, int *header
     }
 
     // additional security headers
-    strcpy(temp_header, "Referrer-Policy: strict-origin-when-cross-origin\r\n");
+    snprintf(temp_header, sizeof(temp_header), "%s", "Referrer-Policy: strict-origin-when-cross-origin\r\n");
+
     if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
     {
         strcat(response_buffer, temp_header);
         *header_length += strlen(temp_header);
     }
 
-    strcpy(temp_header, "X-Permitted-Cross-Domain-Policies: none\r\n");
+    snprintf(temp_header, sizeof(temp_header), "%s", "X-Permitted-Cross-Domain-Policies: none\r\n");
+
     if (strlen(response_buffer) + strlen(temp_header) < buffer_size)
     {
         strcat(response_buffer, temp_header);
@@ -1025,8 +1340,8 @@ rate_limit_config_t *init_rate_limiting()
     }
 
     // default configuration - moderate protection
-    config->requests_per_window = 60;
-    config->window_size = 60;
+    config->requests_per_window = 600;
+    config->window_size = 600;
     config->ban_duration = 300;
     config->max_entries = 1000; // track up to 1000 ips
     config->strict_mode = 1;    // enable progressive penalties
@@ -1056,15 +1371,32 @@ rate_limit_config_t *init_rate_limiting()
 }
 
 // find or create rate limit entry for an IP
+// CRITICAL: This function MUST only be called while holding the config mutex
+// The caller is responsible for mutex synchronization
 rate_limit_entry_t *find_or_create_entry(rate_limit_config_t *config, const char *client_ip)
 {
+    if (!config || !client_ip)
+    {
+        return NULL;
+    }
+
     time_t now = time(NULL);
+
+    // Validate that entry_count is within bounds (defense against corruption)
+    if (config->entry_count < 0 || config->entry_count > config->max_entries)
+    {
+        printf("[CRITICAL] Rate limiting corruption detected: entry_count=%d, max=%d\n",
+               config->entry_count, config->max_entries);
+        config->entry_count = 0; // Reset to safe state
+    }
 
     // first, look for an existing entry
     for (int i = 0; i < config->entry_count; i++)
     {
         if (strcmp(config->entries[i].client_ip, client_ip) == 0)
         {
+            // Update last_request time for LRU tracking
+            config->entries[i].last_request = now;
             return &config->entries[i];
         }
     }
@@ -1072,18 +1404,27 @@ rate_limit_entry_t *find_or_create_entry(rate_limit_config_t *config, const char
     // if we have room, create a new entry
     if (config->entry_count < config->max_entries)
     {
-        rate_limit_entry_t *entry = &config->entries[config->entry_count];
-        strcpy(entry->client_ip, client_ip);
+        int entry_index = config->entry_count; // Capture index before increment
+        rate_limit_entry_t *entry = &config->entries[entry_index];
+
+        // Initialize entry safely
+        memset(entry, 0, sizeof(rate_limit_entry_t));
+        snprintf(entry->client_ip, sizeof(entry->client_ip), "%s", client_ip);
         entry->window_start = now;
+        entry->last_request = now;
         entry->request_count = 0;
-        entry->last_request = 0;
         entry->blocked_until = 0;
         entry->violation_count = 0;
+        entry->burst_count = 0;
+        entry->burst_second = 0;
+
+        // Increment entry_count AFTER initialization to prevent race conditions
         config->entry_count++;
         return entry;
     }
 
     // cache full - find oldest entry to replace (LRU eviction)
+    // Find entry with oldest last_request time
     rate_limit_entry_t *oldest = &config->entries[0];
     for (int i = 1; i < config->max_entries; i++)
     {
@@ -1093,13 +1434,16 @@ rate_limit_entry_t *find_or_create_entry(rate_limit_config_t *config, const char
         }
     }
 
-    // Replace oldest entry
-    strcpy(oldest->client_ip, client_ip);
+    // Safely replace oldest entry - clear all fields first
+    memset(oldest, 0, sizeof(rate_limit_entry_t));
+    snprintf(oldest->client_ip, sizeof(oldest->client_ip), "%s", client_ip);
     oldest->window_start = now;
+    oldest->last_request = now;
     oldest->request_count = 0;
-    oldest->last_request = 0;
     oldest->blocked_until = 0;
     oldest->violation_count = 0;
+    oldest->burst_count = 0;
+    oldest->burst_second = 0;
 
     return oldest;
 }
@@ -1115,13 +1459,33 @@ rate_limit_result_t check_rate_limit(rate_limit_config_t *config, const char *cl
     pthread_mutex_lock(&config->mutex);
 
     time_t now = time(NULL);
+
+    // Double-check that we have the lock (defensive programming)
+    if (pthread_mutex_trylock(&config->mutex) == 0)
+    {
+        // This should never happen - if trylock succeeds, we didn't have the lock
+        printf("[CRITICAL] Rate limiting mutex not held properly!\n");
+        pthread_mutex_unlock(&config->mutex); // Release the extra lock
+        pthread_mutex_unlock(&config->mutex); // Release the original lock
+        return RATE_LIMIT_ALLOW;
+    }
+
     rate_limit_entry_t *entry = find_or_create_entry(config, client_ip);
 
-    // check if ip is currently banned
+    // Check if entry creation/lookup failed
+    if (!entry)
+    {
+        pthread_mutex_unlock(&config->mutex);
+        printf("[ERROR] Failed to find or create rate limit entry for IP: %s\n", client_ip);
+        return RATE_LIMIT_ALLOW; // Fail open for availability
+    }
+
+    // check if IP is currently banned
     if (entry->blocked_until > now)
     {
         pthread_mutex_unlock(&config->mutex);
-        printf("[SECURITY] Blocked request from banned IP: %s (ban expires in %lds)\n", client_ip, entry->blocked_until - now);
+        printf("[SECURITY] Blocked request from banned IP: %s (ban expires in %lds)\n",
+               client_ip, entry->blocked_until - now);
         return RATE_LIMIT_BAN;
     }
 
@@ -1130,29 +1494,30 @@ rate_limit_result_t check_rate_limit(rate_limit_config_t *config, const char *cl
     {
         entry->window_start = now;
         entry->request_count = 0;
+        entry->burst_count = 0;
+        entry->burst_second = 0;
     }
 
-    // check for burst (too many requests in 1 second)
-    if (entry->last_request > 0 && (now - entry->last_request == 0))
+    // burst detection (too many requests in the same second)
+    if (entry->burst_second == now)
     {
-        // multiple requests in same second - count them
-        static int same_second_count = 0;
-        same_second_count++;
-
-        if (same_second_count > config->burst_threshold)
+        entry->burst_count++;
+        if (entry->burst_count > config->burst_threshold)
         {
             entry->violation_count++;
             entry->blocked_until = now + (config->ban_duration * entry->violation_count);
 
             pthread_mutex_unlock(&config->mutex);
-            printf("[SECURITY] Burst detected from %s: %d requests/second (banned for %ds)\n", client_ip, same_second_count, config->ban_duration * entry->violation_count);
+            printf("[SECURITY] Burst detected from %s: %d requests/second (banned for %ds)\n",
+                   client_ip, entry->burst_count,
+                   config->ban_duration * entry->violation_count);
             return RATE_LIMIT_BAN;
         }
     }
     else
     {
-        // Reset burst counter for new second
-        static int same_second_count = 0;
+        entry->burst_second = now;
+        entry->burst_count = 1;
     }
 
     entry->last_request = now;
@@ -1165,28 +1530,32 @@ rate_limit_result_t check_rate_limit(rate_limit_config_t *config, const char *cl
 
         if (config->strict_mode)
         {
-            // Progressive penalties: longer bans for repeat offenders
+            // Progressive penalties
             int penalty_multiplier = (entry->violation_count > 5) ? 5 : entry->violation_count;
             entry->blocked_until = now + (config->ban_duration * penalty_multiplier);
 
             pthread_mutex_unlock(&config->mutex);
-            printf("[SECURITY] Rate limit exceeded by %s: %d/%d requests (banned for %ds, violation #%d)\n", client_ip, entry->request_count, config->requests_per_window, config->ban_duration * penalty_multiplier, entry->violation_count);
+            printf("[SECURITY] Rate limit exceeded by %s: %d/%d requests "
+                   "(banned for %ds, violation #%d)\n",
+                   client_ip, entry->request_count, config->requests_per_window,
+                   config->ban_duration * penalty_multiplier, entry->violation_count);
             return RATE_LIMIT_BLOCK;
         }
         else
         {
-            // Simple mode: just block this request
             pthread_mutex_unlock(&config->mutex);
-            printf("[SECURITY] Rate limit exceeded by %s: %d/%d requests\n", client_ip, entry->request_count, config->requests_per_window);
+            printf("[SECURITY] Rate limit exceeded by %s: %d/%d requests\n",
+                   client_ip, entry->request_count, config->requests_per_window);
             return RATE_LIMIT_BLOCK;
         }
     }
 
-    // Warn when approaching limit (80% of limit)
+    // Warn when approaching limit (80%)
     if (entry->request_count > (config->requests_per_window * 0.8))
     {
         pthread_mutex_unlock(&config->mutex);
-        printf("[WARNING] IP %s approaching rate limit: %d/%d requests\n", client_ip, entry->request_count, config->requests_per_window);
+        printf("[WARNING] IP %s approaching rate limit: %d/%d requests\n",
+               client_ip, entry->request_count, config->requests_per_window);
         return RATE_LIMIT_WARN;
     }
 
@@ -1194,74 +1563,108 @@ rate_limit_result_t check_rate_limit(rate_limit_config_t *config, const char *cl
     return RATE_LIMIT_ALLOW;
 }
 
+// Protects all ddos_stats updates with the same mutex used for rate-limit entries.
 int detect_ddos_pattern(rate_limit_config_t *config)
 {
-    time_t now = time(NULL);
+    if (!config)
+        return 0;
 
-    // reset stats window every minute
-    if (now - ddos_stats.window_start >= 60)
+    time_t now = time(NULL);
+    int window = (config->window_size > 0) ? config->window_size : 60;
+
+    // EMA smoothing state — persists across calls (thread-safe with static mutex)
+    static double ema_active_ips = 0.0;
+    static double ema_blocked = 0.0;
+    static pthread_mutex_t ema_mutex = PTHREAD_MUTEX_INITIALIZER;
+    const double alpha = 0.30; // smoothing factor (0..1). Larger = more responsive.
+
+    int ddos_detected = 0;
+
+    // Hold the mutex for the whole read/update of ddos_stats to avoid races
+    pthread_mutex_lock(&config->mutex);
+
+    // Reset stats window when it elapses (protected by mutex)
+    if (now - ddos_stats.window_start >= window)
     {
         ddos_stats.window_start = now;
         ddos_stats.total_requests = 0;
         ddos_stats.unique_ips = 0;
         ddos_stats.blocked_requests = 0;
         ddos_stats.top_offender_count = 0;
-        strcpy(ddos_stats.top_offender, "");
+        ddos_stats.top_offender[0] = '\0';
     }
 
-    pthread_mutex_lock(&config->mutex);
-
-    // count active IPs and find top offender
+    // Local accumulators
     int active_ips = 0;
     int max_requests = 0;
+    int blocked_requests = 0;
+    int total_requests = 0;
+    char top_offender_local[INET_ADDRSTRLEN] = "";
 
     for (int i = 0; i < config->entry_count; i++)
     {
         rate_limit_entry_t *entry = &config->entries[i];
 
-        if (now - entry->window_start < 60)
+        if (now - entry->window_start < window)
         {
-            // active in last minute
             active_ips++;
+            total_requests += entry->request_count;
 
             if (entry->request_count > max_requests)
             {
                 max_requests = entry->request_count;
-                strcpy(ddos_stats.top_offender, entry->client_ip);
-                ddos_stats.top_offender_count = entry->request_count;
+                snprintf(top_offender_local, sizeof(top_offender_local), "%s", entry->client_ip);
             }
 
             if (entry->blocked_until > now)
-            {
-                ddos_stats.blocked_requests++;
-            }
+                blocked_requests++;
         }
     }
 
+    // Commit local values to shared ddos_stats while still holding lock
+    ddos_stats.total_requests = total_requests;
     ddos_stats.unique_ips = active_ips;
+    ddos_stats.blocked_requests = blocked_requests;
+    ddos_stats.top_offender_count = max_requests;
+    if (top_offender_local[0] != '\0')
+        snprintf(ddos_stats.top_offender, sizeof(ddos_stats.top_offender), "%s", top_offender_local);
+
     pthread_mutex_unlock(&config->mutex);
 
-    // DDoS detection criteria
-    int ddos_detected = 0;
+    // Update EMA smoothing with proper thread synchronization
+    pthread_mutex_lock(&ema_mutex);
+    double current_ema_active_ips = alpha * (double)active_ips + (1.0 - alpha) * ema_active_ips;
+    double current_ema_blocked = alpha * (double)blocked_requests + (1.0 - alpha) * ema_blocked;
 
-    // criteria 1: Too many unique IPs hitting server simultaneously
-    if (active_ips > 50)
+    // Update the static variables
+    ema_active_ips = current_ema_active_ips;
+    ema_blocked = current_ema_blocked;
+    pthread_mutex_unlock(&ema_mutex);
+
+    // Detection thresholds (tweak as needed)
+    const int unique_ips_hard_threshold = 50; // old behavior threshold
+    const int blocked_hard_threshold = 10;    // old behavior threshold
+    const int top_offender_multiplier = 3;    // same as before
+
+    // Criterion 1: too many unique IPs — use EMA to avoid very short spikes
+    if (current_ema_active_ips > (double)unique_ips_hard_threshold)
     {
-        printf("[ALERT] Potential DDoS: %d unique IPs active\n", active_ips);
+        printf("[ALERT] Potential DDoS (smoothed): EMA active IPs=%.1f (raw=%d)\n", current_ema_active_ips, active_ips);
         ddos_detected = 1;
     }
 
-    // criteria 2: High percentage of blocked requests
-    if (ddos_stats.blocked_requests > 10)
+    // Criterion 2: high number of blocked requests (smoothed)
+    if (current_ema_blocked > (double)blocked_hard_threshold)
     {
-        printf("[ALERT] Potential DDoS: %d blocked requests in last minute\n", ddos_stats.blocked_requests);
+        printf("[ALERT] Potential DDoS (smoothed): EMA blocked reqs=%.1f (raw=%d)\n", current_ema_blocked, blocked_requests);
         ddos_detected = 1;
     }
 
-    // criteria 3: Single IP with excessive requests
-    if (ddos_stats.top_offender_count > config->requests_per_window * 3)
+    // Criterion 3: single IP making excessive requests (raw check — keep strict)
+    if (ddos_stats.top_offender_count > config->requests_per_window * top_offender_multiplier)
     {
-        printf("[ALERT] Potential DDoS: IP %s made %d requests\n", ddos_stats.top_offender, ddos_stats.top_offender_count);
+        printf("[ALERT] Potential DDoS: IP %s made %d requests\n",
+               ddos_stats.top_offender, ddos_stats.top_offender_count);
         ddos_detected = 1;
     }
 
@@ -1438,83 +1841,55 @@ int add_security_rule(security_filter_t *filter, const char *pattern, security_a
     rule->action = action;
     rule->ban_duration = ban_duration;
     rule->case_sensitive = case_sensitive;
+    rule->regex_compiled = 0; // Initialize as not compiled
 
     filter->rule_count++;
     return 0;
 }
 
-// simple pattern matching (basic regex-like functionality)
+// Legacy pattern match function (still needed for some cases)
 int pattern_match(const char *text, const char *pattern, int case_sensitive)
 {
     if (!text || !pattern)
-    {
         return 0;
-    }
 
-    char *text_copy = strdup(text);
-    char *pattern_copy = strdup(pattern);
-
-    if (!text_copy || !pattern_copy)
-    {
-        free(text_copy);
-        free(pattern_copy);
-        return 0;
-    }
-
-    // Convert to lowercase if case insensitive
+    regex_t regex;
+    int flags = REG_NOSUB | REG_EXTENDED;
     if (!case_sensitive)
+        flags |= REG_ICASE;
+
+    if (regcomp(&regex, pattern, flags) != 0)
+        return 0;
+
+    int ret = regexec(&regex, text, 0, NULL, 0);
+    regfree(&regex);
+
+    return (ret == 0);
+}
+
+// Optimized pattern match using cached regex
+int cached_pattern_match(const char *text, security_rule_t *rule)
+{
+    if (!text || !rule)
+        return 0;
+
+    // Compile regex if not already compiled
+    if (!rule->regex_compiled)
     {
-        for (int i = 0; text_copy[i]; i++)
+        int flags = REG_NOSUB | REG_EXTENDED;
+        if (!rule->case_sensitive)
+            flags |= REG_ICASE;
+
+        if (regcomp(&rule->compiled_regex, rule->pattern, flags) != 0)
         {
-            text_copy[i] = tolower(text_copy[i]);
+            printf("[WARNING] Failed to compile regex pattern: %s\n", rule->pattern);
+            return 0;
         }
-        for (int i = 0; pattern_copy[i]; i++)
-        {
-            pattern_copy[i] = tolower(pattern_copy[i]);
-        }
+        rule->regex_compiled = 1;
     }
 
-    // Simple wildcard matching and basic regex
-    int match = 0;
-
-    // Check for exact substring match first
-    if (strstr(text_copy, pattern_copy))
-    {
-        match = 1;
-    }
-    // Handle basic regex patterns
-    else if (strchr(pattern_copy, '\\'))
-    {
-        // Simple regex handling - convert \\( to (, \\. to ., etc.
-        char *regex_pattern = malloc(strlen(pattern_copy) + 1);
-        if (regex_pattern)
-        {
-            int j = 0;
-            for (int i = 0; pattern_copy[i]; i++)
-            {
-                if (pattern_copy[i] == '\\' && pattern_copy[i + 1])
-                {
-                    i++; // Skip backslash
-                    regex_pattern[j++] = pattern_copy[i];
-                }
-                else
-                {
-                    regex_pattern[j++] = pattern_copy[i];
-                }
-            }
-            regex_pattern[j] = '\0';
-
-            if (strstr(text_copy, regex_pattern))
-            {
-                match = 1;
-            }
-            free(regex_pattern);
-        }
-    }
-
-    free(text_copy);
-    free(pattern_copy);
-    return match;
+    // Execute the cached regex
+    return (regexec(&rule->compiled_regex, text, 0, NULL, 0) == 0);
 }
 
 security_check_result_t validate_request_security(security_filter_t *filter, const char *request_uri, const char *user_agent, const char *request_body)
@@ -1529,23 +1904,36 @@ security_check_result_t validate_request_security(security_filter_t *filter, con
     // Combine all request data for scanning
     size_t total_len = strlen(request_uri) + (user_agent ? strlen(user_agent) : 0) + (request_body ? strlen(request_body) : 0) + 10;
 
-    char *combined_data = malloc(total_len);
-    if (!combined_data)
+    // Use stack allocation for small requests, fallback to malloc for large ones
+    char stack_buffer[8192]; // 8KB stack buffer for most requests
+    char *combined_data;
+    int use_stack = (total_len < sizeof(stack_buffer));
+
+    if (use_stack)
     {
-        return result;
+        combined_data = stack_buffer;
+    }
+    else
+    {
+        combined_data = malloc(total_len + 1);
+        if (!combined_data)
+        {
+            return result;
+        }
     }
 
-    snprintf(combined_data, total_len, "%s %s %s", request_uri, user_agent ? user_agent : "", request_body ? request_body : "");
+    snprintf(combined_data, total_len + 1, "%s %s %s", request_uri, user_agent ? user_agent : "", request_body ? request_body : "");
 
     // check against all security rules
     for (int i = 0; i < filter->rule_count; i++)
     {
         security_rule_t *rule = &filter->rules[i];
 
-        if (pattern_match(combined_data, rule->pattern, rule->case_sensitive))
+        if (cached_pattern_match(combined_data, rule))
         {
-            strcpy(result.threat_type, rule->description);
-            strcpy(result.matched_pattern, rule->pattern);
+            snprintf(result.threat_type, sizeof(result.threat_type), "%s", rule->description);
+
+            snprintf(result.matched_pattern, sizeof(result.matched_pattern), "%s", rule->pattern);
 
             switch (rule->action)
             {
@@ -1571,91 +1959,131 @@ security_check_result_t validate_request_security(security_filter_t *filter, con
         }
     }
 
-    free(combined_data);
+    // Only free if we used malloc
+    if (!use_stack)
+    {
+        free(combined_data);
+    }
     return result;
 }
 
-// validate and sanitize file paths
+// Replaces previous validate_file_path. It returns 0 on success and fills safe_path
+// (safe_path will be a canonical path under docroot even if the file doesn't exist).
+// Returns -1 for path traversal/invalid, -2 for other errors (like buffer overflow).
 int validate_file_path(const char *requested_path, char *safe_path, size_t safe_path_len)
 {
     if (!requested_path || !safe_path)
-    {
         return -1;
-    }
 
-    // Remove leading slash if present
-    const char *path = requested_path;
-    if (path[0] == '/')
+    // URL-decode iteratively to handle double/triple encoding attacks
+    char decoded[MAX_PATH];
+    char temp_buffer[MAX_PATH];
+
+    // Start with the original path
+    strncpy(decoded, requested_path, sizeof(decoded) - 1);
+    decoded[sizeof(decoded) - 1] = '\0';
+
+    // Decode up to 3 times to handle multiple levels of encoding
+    for (int decode_round = 0; decode_round < 3; decode_round++)
     {
-        path++;
-    }
+        // Copy current state to temp buffer
+        strncpy(temp_buffer, decoded, sizeof(temp_buffer) - 1);
+        temp_buffer[sizeof(temp_buffer) - 1] = '\0';
 
-    // decode the path first
-    char decoded_path[MAX_PATH];
-    url_decode(decoded_path, path);
+        // Decode into decoded buffer
+        url_decode(decoded, temp_buffer, sizeof(decoded));
 
-    // Check for path traversal attempts
-    if (strstr(decoded_path, "..") ||
-        strstr(decoded_path, "%2e%2e") ||
-        strstr(decoded_path, "%c0%ae") ||
-        decoded_path[0] == '/' ||
-        strstr(decoded_path, "\\"))
-    {
-
-        printf("[SECURITY] Path traversal attempt detected: %s\n", decoded_path);
-        return -1;
-    }
-
-    // Check for system file access attempts
-    const char *forbidden_paths[] = {
-        "etc/passwd", "etc/shadow", "etc/hosts",
-        "proc/", "sys/", "dev/", "var/log/",
-        "boot/", "root/", "home/",
-        ".ssh/", ".bash_history", ".env",
-        "config", "settings", "database",
-        NULL};
-
-    for (int i = 0; forbidden_paths[i]; i++)
-    {
-        if (strstr(decoded_path, forbidden_paths[i]))
+        // If no change occurred, we're done decoding
+        if (strcmp(decoded, temp_buffer) == 0)
         {
-            printf("[SECURITY] Forbidden path access attempt: %s\n", decoded_path);
-            return -1;
+            break;
         }
+
+        printf("[SECURITY] Multiple URL decoding round %d: %s\n", decode_round + 1, decoded);
     }
 
-    // Ensure path stays within document root
-    char normalized_path[MAX_PATH];
-    snprintf(normalized_path, sizeof(normalized_path), "./%s", decoded_path);
+    // Strip leading '/' characters so we join onto docroot cleanly
+    char *p = decoded;
+    while (*p == '/')
+        p++;
 
-    // Additional validation: ensure file extension is allowed
-    const char *allowed_extensions[] = {
-        ".html", ".htm", ".css", ".js", ".json", ".txt", ".png",
-        ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf", ".zip",
-        NULL};
-
-    char *extension = strrchr(decoded_path, '.');
-    if (extension)
+    // Normalize path (resolve ., ..) WITHOUT touching filesystem
+    char normalized[MAX_PATH];
+    int norm_ret = normalize_path(p, normalized, sizeof(normalized));
+    if (norm_ret == -1)
     {
-        int allowed = 0;
-        for (int i = 0; allowed_extensions[i]; i++)
+        // traversal attempt detected - log to server only, no details to client
+        printf("[SECURITY] Path traversal attempt detected from client\n");
+        return -1;
+    }
+    else if (norm_ret != 0)
+    {
+        printf("[SECURITY] Path normalization failed (err=%d)\n", norm_ret);
+        return -2;
+    }
+
+    // Get canonical docroot (realpath of ./client)
+    char docroot[MAX_PATH];
+    if (!realpath("./client", docroot))
+    {
+        printf("[ERROR] Failed to resolve document root directory\n");
+        return -2;
+    }
+
+    // If normalized is empty -> means client requested "/", map to index later
+    char candidate[MAX_PATH];
+    if (normalized[0] == '\0')
+    {
+        // point to docroot alone
+        snprintf(candidate, sizeof(candidate), "%s", docroot);
+    }
+    else
+    {
+        // join docroot and normalized path
+        snprintf(candidate, sizeof(candidate), "%s/%s", docroot, normalized);
+    }
+
+    // Confirm candidate path starts with docroot (should be by construction, but double-check)
+    if (strncmp(candidate, docroot, strlen(docroot)) != 0)
+    {
+        printf("[SECURITY] Path escapes document root after join\n");
+        return -1;
+    }
+
+    // Optional: check extension whitelist (the original code used resolved path for ext)
+    const char *ext = strrchr(candidate, '.');
+    if (!ext)
+    {
+        // no extension -> allow (could be a directory or index)
+        // We'll let send_file/stat handle directory vs file
+    }
+    else
+    {
+        const char *allowed[] = {".html", ".htm", ".css", ".js", ".json", ".txt",
+                                 ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+                                 ".pdf", ".zip", ".xml", ".webp", NULL};
+        int ok = 0;
+        for (int i = 0; allowed[i]; i++)
         {
-            if (strcasecmp(extension, allowed_extensions[i]) == 0)
+            if (strcasecmp(ext, allowed[i]) == 0)
             {
-                allowed = 1;
+                ok = 1;
                 break;
             }
         }
-        if (!allowed)
+        if (!ok)
         {
-            printf("[SECURITY] Forbidden file extension: %s\n", extension);
+            printf("[SECURITY] Forbidden file extension requested\n");
             return -1;
         }
     }
 
-    strncpy(safe_path, normalized_path, safe_path_len - 1);
-    safe_path[safe_path_len - 1] = '\0';
-
+    // Return candidate (may or may not exist). send_file/stat will return 404 if missing.
+    if (strlen(candidate) >= safe_path_len)
+    {
+        return -2;
+    }
+    snprintf(safe_path, safe_path_len, "%s", candidate);
     return 0;
 }
 
@@ -1668,20 +2096,28 @@ int safe_send(int sockfd, const void *buf, size_t len)
     while (total_sent < len)
     {
         ssize_t sent = send(sockfd, data + total_sent, len - total_sent, MSG_NOSIGNAL);
-        if (sent <= 0)
+        if (sent < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                usleep(1000); // Brief pause
+                usleep(1000); // Brief pause then retry
                 continue;
             }
+            // Fatal send error — log for debugging
+            perror("[ERROR] send() failed");
             return -1;
         }
-        total_sent += sent;
+        else if (sent == 0)
+        {
+            // Unexpected, treat as error
+            fprintf(stderr, "[ERROR] send() returned 0\n");
+            return -1;
+        }
+
+        total_sent += (size_t)sent;
     }
     return 0;
 }
-
 // response function with keep-alive support
 void send_response(int client_fd, char *status, negotiated_content_t *content, char *body, size_t body_length, int keep_alive)
 {
@@ -1706,12 +2142,12 @@ void send_response(int client_fd, char *status, negotiated_content_t *content, c
         else
         {
             // Charset already present, use as-is
-            strcpy(content_type_header, content->content_type);
+            snprintf(content_type_header, sizeof(content_type_header), "%s", content->content_type);
         }
     }
     else
     {
-        strcpy(content_type_header, content->content_type);
+        snprintf(content_type_header, sizeof(content_type_header), "%s", content->content_type);
     }
 
     int header_length = snprintf(response, sizeof(response),
@@ -1823,23 +2259,24 @@ void send_file(int client_fd, char *filepath, int keep_alive, http_request_t *re
 
     // content negotiation
     negotiated_content_t content = negotiate_content(filepath, request);
+
     // Check if client accepts our content type
-    if (strlen(request->accept) > 0)
+    if (request->accept[0] != '\0')
     {
         float quality = parse_quality(request->accept, content.content_type);
-        if (quality == 0.0)
+        if (quality == 0.0f)
         {
             // Send 406 Not Acceptable
-            char *body =
+            const char *body =
                 "<!DOCTYPE html><html><head><title>406 Not Acceptable</title></head>"
                 "<body><h1>406 Not Acceptable</h1>"
                 "<p>The requested resource cannot be provided in a format acceptable to your client.</p>"
                 "</body></html>";
-            negotiated_content_t content = {0};
-            strcpy(content.content_type, "text/html");
-            strcpy(content.charset, "utf-8");
+            negotiated_content_t c = {0};
+            snprintf(c.content_type, sizeof(c.content_type), "%s", "text/html");
+            snprintf(c.charset, sizeof(c.charset), "%s", "utf-8");
 
-            send_response(client_fd, HTTP_406, &content, body, strlen(body), keep_alive);
+            send_response(client_fd, HTTP_406, &c, (char *)body, strlen(body), keep_alive);
             return;
         }
     }
@@ -1852,51 +2289,105 @@ void send_file(int client_fd, char *filepath, int keep_alive, http_request_t *re
         return;
     }
 
-    // check if we should actually compress the file
-    int do_compression = content.should_compress && should_compress_content(content.content_type, file_stat.st_size);
+    size_t fsize = (size_t)file_stat.st_size;
+    int do_compression = content.should_compress && should_compress_content(content.content_type, fsize);
+
     if (do_compression)
     {
-        // read entire file into memory for compression
-        char *file_content = malloc(file_stat.st_size);
+        // Security: Check file size limit for compression to prevent memory exhaustion
+        if (fsize > MAX_COMPRESSION_FILE_SIZE)
+        {
+            printf("[SECURITY] File too large for compression: %zu bytes (max: %d bytes)\n",
+                   fsize, MAX_COMPRESSION_FILE_SIZE);
+
+            // Disable compression for large files, serve uncompressed
+            content.encoding[0] = '\0';
+            content.should_compress = 0;
+            do_compression = 0;
+
+            // Continue to serve the file uncompressed below
+        }
+    }
+
+    if (do_compression)
+    {
+        // Read entire file into memory for compression (robust loop)
+        char *file_content = (char *)malloc(fsize);
         if (file_content == NULL)
         {
-            printf("[ERROR] Failed to allocate memory for file compression\n");
+            printf("[ERROR] Failed to allocate memory for file compression (%zu bytes)\n", fsize);
             close(file_fd);
             send_500(client_fd, keep_alive);
             return;
         }
 
-        if (read(file_fd, file_content, file_stat.st_size) != file_stat.st_size)
+        size_t total_read = 0;
+        while (total_read < fsize)
         {
-            printf("[ERROR] Failed to read complete file for compression\n");
-            free(file_content);
-            close(file_fd);
-            send_500(client_fd, keep_alive);
-            return;
+            ssize_t n = read(file_fd, file_content + total_read, fsize - total_read);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue; // retry on interrupt
+                if (errno == EAGAIN)
+                {
+                    usleep(1000);
+                    continue;
+                } // brief backoff
+                perror("[ERROR] File read failed");
+                free(file_content);
+                close(file_fd);
+                send_500(client_fd, keep_alive);
+                return;
+            }
+            if (n == 0)
+            {
+                // Unexpected EOF
+                printf("[ERROR] Unexpected EOF while reading file for compression\n");
+                free(file_content);
+                close(file_fd);
+                send_500(client_fd, keep_alive);
+                return;
+            }
+            total_read += (size_t)n;
         }
 
         close(file_fd);
 
-        // compress the content
-        char *compressed_content;
-        size_t compressed_size;
+        // Compress the content
+        char *compressed_content = NULL;
+        size_t compressed_size = 0;
 
-        if (compress_gzip(file_content, file_stat.st_size, &compressed_content, &compressed_size) == 0)
+        if (compress_gzip(file_content, fsize, &compressed_content, &compressed_size) == 0)
         {
-            printf("[INFO] Compressed %s: %lld -> %zu bytes (%.1f%% reduction)\n", filepath, (long long)file_stat.st_size, compressed_size, 100.0 * (file_stat.st_size - compressed_size) / file_stat.st_size);
+            printf("[INFO] Compressed %s: %lld -> %zu bytes (%.1f%% reduction)\n",
+                   filepath, (long long)fsize, compressed_size,
+                   fsize ? (100.0 * (fsize - compressed_size) / fsize) : 0.0);
 
-            // Send compressed response
             send_response(client_fd, HTTP_200, &content, compressed_content, compressed_size, keep_alive);
 
-            free(compressed_content);
+            // Always free compressed content after use
+            if (compressed_content)
+            {
+                free(compressed_content);
+                compressed_content = NULL;
+            }
         }
         else
         {
             printf("[ERROR] Compression failed, sending uncompressed\n");
-            // Fall back to uncompressed
-            strcpy(content.encoding, "");
+
+            // Defensive: Free compressed_content if it was allocated but compression failed
+            if (compressed_content)
+            {
+                free(compressed_content);
+                compressed_content = NULL;
+            }
+
+            content.encoding[0] = '\0'; // clear encoding
             content.should_compress = 0;
-            send_response(client_fd, HTTP_200, &content, file_content, file_stat.st_size, keep_alive);
+
+            send_response(client_fd, HTTP_200, &content, file_content, fsize, keep_alive);
         }
 
         free(file_content);
@@ -1904,20 +2395,21 @@ void send_file(int client_fd, char *filepath, int keep_alive, http_request_t *re
     else
     {
         // Send uncompressed file
-        strcpy(content.encoding, "");
+        content.encoding[0] = '\0';
         content.should_compress = 0;
 
-        // Send response headers first
-        send_response(client_fd, HTTP_200, &content, NULL, file_stat.st_size, keep_alive);
+        // Send headers first (with known Content-Length)
+        send_response(client_fd, HTTP_200, &content, NULL, fsize, keep_alive);
 
-        // Send file content in chunks
-        if (safe_send_file(client_fd, file_fd, file_stat.st_size) < 0)
+        // Stream file content in chunks
+        if (safe_send_file(client_fd, file_fd, fsize) < 0)
         {
             printf("[ERROR] Failed to send file: %s\n", filepath);
+            // We already sent headers; best we can do is close the socket after this function returns
         }
         else
         {
-            printf("[INFO] File sent uncompressed: %s (%lld bytes)\n", filepath, (long long)file_stat.st_size);
+            printf("[INFO] File sent uncompressed: %s (%lld bytes)\n", filepath, (long long)fsize);
         }
 
         close(file_fd);
@@ -1935,8 +2427,8 @@ void send_404(int client_fd, int keep_alive)
         "</body></html>";
 
     negotiated_content_t content = {0};
-    strcpy(content.content_type, "text/html");
-    strcpy(content.charset, "utf-8");
+    snprintf(content.content_type, sizeof(content.content_type), "%s", "text/html");
+    snprintf(content.charset, sizeof(content.charset), "%s", "utf-8");
 
     send_response(client_fd, HTTP_404, &content, body, strlen(body), keep_alive);
 }
@@ -1951,8 +2443,8 @@ void send_400(int client_fd, int keep_alive)
         "</body></html>";
 
     negotiated_content_t content = {0};
-    strcpy(content.content_type, "text/html");
-    strcpy(content.charset, "utf-8");
+    snprintf(content.content_type, sizeof(content.content_type), "%s", "text/html");
+    snprintf(content.charset, sizeof(content.charset), "%s", "utf-8");
 
     send_response(client_fd, HTTP_400, &content, body, strlen(body), keep_alive);
 }
@@ -1967,8 +2459,8 @@ void send_500(int client_fd, int keep_alive)
         "</body></html>";
 
     negotiated_content_t content = {0};
-    strcpy(content.content_type, "text/html");
-    strcpy(content.charset, "utf-8");
+    snprintf(content.content_type, sizeof(content.content_type), "%s", "text/html");
+    snprintf(content.charset, sizeof(content.charset), "%s", "utf-8");
 
     send_response(client_fd, HTTP_500, &content, body, strlen(body), keep_alive);
 }
@@ -1985,7 +2477,7 @@ void send_security_block_response(int client_fd, const char *threat_type)
         "</body></html>";
 
     char response_body[1024];
-    snprintf(response_body, sizeof(response_body), body, threat_type);
+    snprintf(response_body, sizeof(response_body), body, "%s", threat_type);
 
     char response[BUFFER_SIZE];
     char time_str[128];
@@ -2399,41 +2891,168 @@ void get_current_time(char *buffer)
     strftime(buffer, 128, "%a, %d %b %Y %H:%M:%S GMT", gmt);
 }
 
-// URL decode function
-void url_decode(char *dst, const char *src)
+// URL decode function with bounds checking
+void url_decode(char *dst, const char *src, size_t dst_size)
 {
+    if (!dst || !src || dst_size == 0)
+        return;
+
     char *d = dst;
     const char *s = src;
     char hex[3] = {0};
+    size_t written = 0;
 
-    while (*s)
+    while (*s && written < dst_size - 1) // Leave space for null terminator
     {
         if (*s == '%' && s[1] && s[2])
         {
-            hex[0] = s[1];
-            hex[1] = s[2];
-            *d++ = (char)strtol(hex, NULL, 16);
-            s += 3;
+            // Validate hex digits before conversion
+            if (isxdigit(s[1]) && isxdigit(s[2]))
+            {
+                hex[0] = s[1];
+                hex[1] = s[2];
+                *d++ = (char)strtol(hex, NULL, 16);
+                written++;
+                s += 3;
+            }
+            else
+            {
+                // Invalid hex encoding - copy as literal
+                *d++ = *s++;
+                written++;
+            }
         }
         else if (*s == '+')
         {
             *d++ = ' ';
+            written++;
             s++;
         }
         else
         {
             *d++ = *s++;
+            written++;
         }
     }
-    *d = '\0';
+    *d = '\0'; // Always null terminate
 }
-
 // signal handler for child processes
 void handle_sigchld(int sig)
 {
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0)
         ;
+}
+
+// Cleanup compiled regex patterns in security filter
+void cleanup_security_filter(security_filter_t *filter)
+{
+    if (!filter)
+        return;
+
+    for (int i = 0; i < filter->rule_count; i++)
+    {
+        security_rule_t *rule = &filter->rules[i];
+        if (rule->regex_compiled)
+        {
+            regfree(&rule->compiled_regex);
+            rule->regex_compiled = 0;
+        }
+    }
+
+    if (filter->rules)
+    {
+        free(filter->rules);
+        filter->rules = NULL;
+    }
+    free(filter);
+    printf("[INFO] Security filter cleanup completed\n");
+}
+
+// Normalize a path string (no filesystem calls).
+// - input: e.g. "foo/../bar//baz/./file.txt" or "/foo/bar"
+// - out: normalized path without a leading slash, e.g. "bar/baz/file.txt"
+// Returns 0 on success, -1 on traversal/invalid, -2 on overflow.
+static int normalize_path(const char *input, char *out, size_t outlen)
+{
+    if (!input || !out)
+        return -1;
+
+    // Work on a writable copy
+    char tmp[MAX_PATH];
+    size_t in_len = strlen(input);
+    if (in_len >= sizeof(tmp))
+        return -2;
+    strncpy(tmp, input, sizeof(tmp));
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    // Remove any leading slashes for consistent joining later
+    char *p = tmp;
+    while (*p == '/')
+        p++;
+
+    // Split by '/', use small stack for segments
+    const char *segv[128];
+    int segc = 0;
+    char *tok = strtok(p, "/");
+    while (tok)
+    {
+        if (strcmp(tok, ".") == 0)
+        {
+            // skip
+        }
+        else if (strcmp(tok, "..") == 0)
+        {
+            if (segc == 0)
+            {
+                // Trying to go above document root -> traversal
+                return -1;
+            }
+            segc--; // pop one segment
+        }
+        else if (tok[0] != '\0')
+        {
+            if (segc < (int)(sizeof(segv) / sizeof(segv[0])))
+            {
+                segv[segc++] = tok;
+            }
+            else
+            {
+                return -2; // too many segments
+            }
+        }
+        tok = strtok(NULL, "/");
+    }
+
+    // join back
+    size_t used = 0;
+    if (segc == 0)
+    {
+        // root index
+        if (outlen < 2)
+            return -2;
+        out[0] = '\0'; // empty means docroot
+        return 0;
+    }
+
+    for (int i = 0; i < segc; i++)
+    {
+        size_t need = strlen(segv[i]) + 1; // plus '/' or '\0'
+        if (i > 0)
+            need++; // for separator
+        if (used + need >= outlen)
+            return -2;
+
+        if (i > 0)
+        {
+            out[used++] = '/';
+        }
+        size_t seglen = strlen(segv[i]);
+        memcpy(out + used, segv[i], seglen);
+        used += seglen;
+    }
+    out[used] = '\0';
+    return 0;
 }
 
 // main server with threading
@@ -2487,16 +3106,21 @@ int main(int argc, char *argv[])
     global_rate_limit_config = init_rate_limiting();
     if (!global_rate_limit_config)
     {
-        printf("[ERROR] Failed to initialize rate limiting\n");
-        exit(EXIT_FAILURE);
+        printf("[WARNING] Failed to initialize rate limiting - running without rate limits\n");
     }
 
-    // In main function, after rate limiting initialization:
+    // initialise security filters
     global_security_filter = init_security_filter();
     if (!global_security_filter)
     {
-        printf("[ERROR] Failed to initialize security filter\n");
-        exit(EXIT_FAILURE);
+        printf("[WARNING] Failed to initialize security filter - running without security filtering\n");
+    }
+
+    // Initialize memory pools for performance optimization
+    connection_pool = create_memory_pool(sizeof(client_connection_t), 100);
+    if (!connection_pool)
+    {
+        printf("[WARNING] Failed to initialize connection memory pool - using malloc/free\n");
     }
 
     // Initialize API router
@@ -2510,6 +3134,39 @@ int main(int argc, char *argv[])
     // Main server loop
     while (server_running)
     {
+        // Use select() to make accept() interruptible
+        fd_set read_fds;
+        struct timeval timeout;
+
+        FD_ZERO(&read_fds);
+        FD_SET(server_fd, &read_fds);
+
+        // Check for new connections every 1 second
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        int select_result = select(server_fd + 1, &read_fds, NULL, NULL, &timeout);
+
+        if (select_result < 0)
+        {
+            if (errno == EINTR)
+                continue; // Interrupted by signal - check server_running
+            perror("Select failed");
+            break;
+        }
+
+        if (select_result == 0)
+        {
+            // Timeout - check if we should still be running
+            continue;
+        }
+
+        if (!server_running)
+        {
+            break; // Server shutdown requested
+        }
+
+        // Accept the connection
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0)
         {
@@ -2525,24 +3182,57 @@ int main(int argc, char *argv[])
         printf("[INFO] New client connected from %s:%d\n",
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
+        // Check thread limit to prevent resource exhaustion
+        pthread_mutex_lock(&thread_count_mutex);
+        int current_threads = active_thread_count;
+        pthread_mutex_unlock(&thread_count_mutex);
+
+        if (current_threads >= MAX_THREADS)
+        {
+            printf("[SECURITY] Thread limit reached (%d/%d) - handling client directly\n",
+                   current_threads, MAX_THREADS);
+            // Handle client directly without creating new thread
+            handle_client(client_fd, client_addr);
+            continue;
+        }
+
         // Use threading for better performance
-        client_connection_t *conn = malloc(sizeof(client_connection_t));
+        client_connection_t *conn = connection_pool ? pool_allocate(connection_pool) : malloc(sizeof(client_connection_t));
         if (conn)
         {
             conn->client_fd = client_fd;
             conn->client_addr = client_addr;
             conn->connect_time = time(NULL);
 
+            // Increment thread count before creating thread
+            pthread_mutex_lock(&thread_count_mutex);
+            active_thread_count++;
+            pthread_mutex_unlock(&thread_count_mutex);
+
             pthread_t thread;
-            if (pthread_create(&thread, NULL, handle_client_thread, conn) == 0)
+            int thread_result = pthread_create(&thread, NULL, handle_client_thread, conn);
+            if (thread_result == 0)
             {
                 pthread_detach(thread); // Don't wait for thread to finish
             }
             else
             {
-                printf("[ERROR] Failed to create thread\n");
+                // Thread creation failed - decrement counter
+                pthread_mutex_lock(&thread_count_mutex);
+                active_thread_count--;
+                pthread_mutex_unlock(&thread_count_mutex);
+
+                printf("[ERROR] Failed to create thread: %s (error code: %d)\n",
+                       strerror(thread_result), thread_result);
                 handle_client(client_fd, client_addr);
-                free(conn);
+                if (connection_pool)
+                {
+                    pool_deallocate(connection_pool, conn);
+                }
+                else
+                {
+                    free(conn);
+                }
             }
         }
         else
@@ -2553,6 +3243,26 @@ int main(int argc, char *argv[])
     }
 
     printf("[INFO] Server shutting down...\n");
+
+    // Cleanup resources
+    if (global_rate_limit_config)
+    {
+        cleanup_rate_limiting(global_rate_limit_config);
+        global_rate_limit_config = NULL;
+    }
+
+    if (global_security_filter)
+    {
+        cleanup_security_filter(global_security_filter);
+        global_security_filter = NULL;
+    }
+
+    if (connection_pool)
+    {
+        destroy_memory_pool(connection_pool);
+        connection_pool = NULL;
+    }
+
     close(server_fd);
     return 0;
 }
